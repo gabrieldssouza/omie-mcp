@@ -154,6 +154,58 @@ chmod +x ~/omie-mcp-run.sh
 
 ---
 
+## ☁️ Azure Web Apps + Claude Remote Connector
+
+Este projeto agora pode rodar como um MCP remoto em Azure Web Apps. No Azure, o servidor sobe em HTTP via Streamable HTTP; localmente, ele continua usando `stdio` para o Claude Desktop.
+
+### Como publicar
+
+Use o comando de inicialização do App Service:
+
+```bash
+python -m omie_mcp.server
+```
+
+Se quiser mudar a chave de acesso do bridge, defina a configuração de app `MCP_BRIDGE_KEY`. Se não definir, o código usa a chave hardcoded `omie-mcp-bridge-2026`.
+
+### URL do bridge
+
+Abra `https://SEU-APP.azurewebsites.net/mcp`. A página vai pedir a chave e, depois de preencher, mostrar a URL completa do bridge no formato:
+
+```text
+https://SEU-APP.azurewebsites.net/mcp?key=SUA_CHAVE
+```
+
+Exemplo:
+
+```text
+https://omie-mcp.azurewebsites.net/mcp?key=omie-mcp-bridge-2026
+```
+
+Também existe um health check público em `/healthz`.
+
+### Conectar no Claude
+
+No Claude, adicione um custom connector usando a URL completa que aparece depois de preencher a chave na tela de `/mcp`. O endpoint aceita o segredo por query string ou pelo header `X-Bridge-Key`.
+
+### Rodar localmente em HTTP
+
+Se quiser testar o bridge localmente antes de publicar, execute:
+
+```bash
+set MCP_TRANSPORT=http
+python -m omie_mcp.server
+```
+
+No PowerShell, use:
+
+```powershell
+$env:MCP_TRANSPORT = "http"
+python -m omie_mcp.server
+```
+
+---
+
 ## 🔧 Referência das ferramentas
 
 ### Fornecedores
