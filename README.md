@@ -158,6 +158,21 @@ chmod +x ~/omie-mcp-run.sh
 
 Este projeto agora pode rodar como um MCP remoto em Azure Web Apps. No Azure, o servidor sobe em HTTP via Streamable HTTP; localmente, ele continua usando `stdio` para o Claude Desktop.
 
+### Passo a passo
+
+1. Crie um App Service no Azure usando Linux e Python 3.12.
+2. No App Service, configure as variáveis de ambiente `OMIE_APP_KEY` e `OMIE_APP_SECRET`.
+3. Defina o comando de inicialização como `python -m omie_mcp.server`.
+4. No Azure Entra ID, abra o App Registration ou Managed Identity usado pelo deploy.
+5. Em Federated credentials, crie uma credencial com:
+  - Issuer: `https://token.actions.githubusercontent.com`
+  - Subject: `repo:gabrieldssouza/omie-mcp:ref:refs/heads/master`
+  - Audience: `api://AzureADTokenExchange`
+6. No GitHub, confirme os secrets usados pelo workflow: `AZUREAPPSERVICE_CLIENTID_968452A927C2484AA241FE13B3FA8216`, `AZUREAPPSERVICE_TENANTID_DECA91E2E0DC4E3085B28743DABD2D10` e `AZUREAPPSERVICE_SUBSCRIPTIONID_5B0F40755FCF4593B781BBDAAB74E33C`.
+7. Faça um push na branch `master` para disparar o deploy.
+8. Depois do deploy, abra `https://SEU-APP.azurewebsites.net/mcp`.
+9. Clique em Vincular, informe a chave do bridge e use a URL liberada no conector do Claude.
+
 ### Como publicar
 
 Use o comando de inicialização do App Service:
