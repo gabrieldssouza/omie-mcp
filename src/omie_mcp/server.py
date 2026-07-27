@@ -3,6 +3,7 @@
 import os
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
+from urllib.parse import parse_qs
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -60,7 +61,7 @@ HTML_PAGE = """<!doctype html>
     <main class="card">
         <h1>omie-mcp bridge</h1>
         <p>Digite a chave para liberar o acesso ao bridge. Depois disso, copie a URL gerada e use-a no Claude.</p>
-        <form id="bridge-form">
+        <form id="bridge-form" method="post" action="/mcp">
             <label for="key">Chave</label>
             <input id="key" name="key" type="password" placeholder="Digite a chave do bridge" autocomplete="off" autofocus>
             <button type="submit">Acessar bridge</button>
@@ -75,20 +76,21 @@ HTML_PAGE = """<!doctype html>
         const bridgeUrl = document.getElementById('bridge-url');
 
         form.addEventListener('submit', (event) => {
-            event.preventDefault();
             const key = keyInput.value.trim();
             if (!key) {
+                event.preventDefault();
                 status.textContent = 'Informe a chave para continuar.';
                 bridgeUrl.hidden = true;
                 return;
             }
 
-            const url = new URL(window.location.href);
-            url.searchParams.set('key', key);
-            bridgeUrl.hidden = false;
-            bridgeUrl.innerHTML = 'URL do bridge: <code>' + url.toString() + '</code>';
-            status.textContent = 'Use esta URL completa no Claude Remote Connector.';
-            window.history.replaceState({}, '', url.toString());
+            if (window.location.protocol === 'https:') {
+                const target = new URL(window.location.href);
+                target.searchParams.set('key', key);
+                bridgeUrl.hidden = false;
+                bridgeUrl.innerHTML = 'URL liberada: <code>' + target.toString() + '</code>';
+                status.textContent = 'Se o Claude pedir, use esta URL liberada.';
+            }
         });
     </script>
 </body>
@@ -126,15 +128,35 @@ class KeyedBridgeApp:
 
     def _bridge_key_from_scope(self, scope) -> str:
         query_string = scope.get("query_string", b"").decode("utf-8", errors="ignore")
-        for chunk in query_string.split("&"):
-            if chunk.startswith("key="):
-                return chunk[4:]
+        query_params = parse_qs(query_string)
+        if query_params.get("key"):
+            return query_params["key"][0]
 
         header_key = self._header(scope, b"x-bridge-key")
         if header_key:
             return header_key
 
         return ""
+
+    async def _handle_bridge_login(self, scope, receive, send) -> None:
+        body = b""
+        more_body = True
+        while more_body:
+            message = await receive()
+            if message["type"] != "http.request":
+                continue
+            body += message.get("body", b"")
+            more_body = message.get("more_body", False)
+
+        form_data = parse_qs(body.decode("utf-8", errors="ignore"))
+        provided_key = form_data.get("key", [""])[0]
+
+        if provided_key != self.api_key:
+            await _send_text_response(send, 401, "Invalid bridge key")
+            return
+
+        redirect_to = f"{self.path_prefix}?key={self.api_key}"
+        await _send_text_response(send, 302, "Bridge liberado", [(b"location", redirect_to.encode("utf-8"))])
 
     async def _serve_landing_page(self, send) -> None:
         body = HTML_PAGE.encode("utf-8")
@@ -162,6 +184,10 @@ class KeyedBridgeApp:
 
         if path == self.path_prefix and self._is_html_request(scope):
             await self._serve_landing_page(send)
+            return
+
+        if path == self.path_prefix and scope.get("method") == "POST":
+            await self._handle_bridge_login(scope, receive, send)
             return
 
         if path != self.path_prefix:

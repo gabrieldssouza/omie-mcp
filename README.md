@@ -170,7 +170,7 @@ Se quiser mudar a chave de acesso do bridge, defina a configuração de app `MCP
 
 ### URL do bridge
 
-Abra `https://SEU-APP.azurewebsites.net/mcp`. A página vai pedir a chave e, depois de preencher, mostrar a URL completa do bridge no formato:
+Abra `https://SEU-APP.azurewebsites.net/mcp`. A página vai pedir a chave e, ao clicar em Vincular, faz `POST /mcp` para validar o acesso e devolver a URL liberada no formato:
 
 ```text
 https://SEU-APP.azurewebsites.net/mcp?key=SUA_CHAVE
@@ -186,7 +186,7 @@ Também existe um health check público em `/healthz`.
 
 ### Conectar no Claude
 
-No Claude, adicione um custom connector usando a URL completa que aparece depois de preencher a chave na tela de `/mcp`. O endpoint aceita o segredo por query string ou pelo header `X-Bridge-Key`.
+No Claude, adicione um custom connector usando a URL completa que aparece depois de clicar em Vincular na tela de `/mcp`. O endpoint aceita o segredo por query string ou pelo header `X-Bridge-Key`.
 
 ### Rodar localmente em HTTP
 
