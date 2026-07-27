@@ -182,16 +182,22 @@ class KeyedBridgeApp:
             await _send_text_response(send, 302, "Redirecting to /mcp", [(b"location", b"/mcp")])
             return
 
-        if path == self.path_prefix and self._is_html_request(scope):
+        if path != self.path_prefix:
+            await _send_text_response(send, 404, "Not found")
+            return
+
+        method = scope.get("method", "")
+
+        # Navegador pedindo a tela de vínculo. Só GET/HEAD: um cliente MCP fala por
+        # POST e nunca manda Accept: text/html, então não cai aqui.
+        if method in {"GET", "HEAD"} and self._is_html_request(scope):
             await self._serve_landing_page(send)
             return
 
-        if path == self.path_prefix and scope.get("method") == "POST":
+        # Submissão do formulário HTML. Precisa checar o content-type: sem isso este
+        # branch engole os POSTs JSON-RPC do protocolo MCP e devolve 401 em todos.
+        if method == "POST" and "application/x-www-form-urlencoded" in self._header(scope, b"content-type").lower():
             await self._handle_bridge_login(scope, receive, send)
-            return
-
-        if path != self.path_prefix:
-            await _send_text_response(send, 404, "Not found")
             return
 
         provided_key = self._bridge_key_from_scope(scope)
@@ -228,6 +234,11 @@ mcp = FastMCP(
         "Datas devem ser informadas no formato dd/mm/aaaa."
     ),
     lifespan=lifespan,
+    # Configuração do transporte HTTP: o KeyedBridgeApp reescreve o path para "/"
+    # antes de delegar, então o FastMCP precisa servir na raiz.
+    streamable_http_path="/",
+    json_response=True,
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
 
 # Registra todas as ferramentas financeiras
@@ -239,11 +250,7 @@ contas_correntes.register(mcp)
 fluxo_caixa.register(mcp)
 
 
-http_app = mcp.streamable_http_app(
-    streamable_http_path="/",
-    json_response=True,
-    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
-)
+http_app = mcp.streamable_http_app()
 
 app = KeyedBridgeApp(http_app, BRIDGE_KEY)
 
