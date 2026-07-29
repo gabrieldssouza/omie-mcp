@@ -1,0 +1,39 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.codespar/mcp-omie",
+  "description": "MCP server for Omie — ERP, customers, products, orders, invoices, financials",
+  "repository": {
+    "url": "https://github.com/codespar/mcp-dev-latam",
+    "source": "github",
+    "subfolder": "packages/erp/omie"
+  },
+  "version": "0.2.2",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@codespar/mcp-omie",
+      "version": "0.2.2",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "OMIE_APP_SECRET",
+          "description": "API key for omie",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": true
+        }
+      ]
+    }
+  ],
+  "provider": {
+    "homepage": "https://www.omie.com.br",
+    "logoUrl": "https://logo.clearbit.com/omie.com.br",
+    "logoFallback": "https://www.google.com/s2/favicons?domain=omie.com.br&sz=128",
+    "docsUrl": "https://developer.omie.com.br",
+    "sandbox": {
+      "available": false
+    }
+  }
+}

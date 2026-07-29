@@ -1,0 +1,53 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+let listToolsHandler: Function;
+let callToolHandler: Function;
+
+vi.mock("@modelcontextprotocol/sdk/server/index.js", () => {
+  class FakeServer {
+    constructor() {}
+    setRequestHandler(schema: any, handler: Function) {
+      if (JSON.stringify(schema).includes("tools/list")) listToolsHandler = handler;
+      if (JSON.stringify(schema).includes("tools/call")) callToolHandler = handler;
+    }
+    connect() { return Promise.resolve(); }
+  }
+  return { Server: FakeServer };
+});
+
+vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({ StdioServerTransport: class {} }));
+
+process.env.OMIE_APP_KEY = "test-key";
+process.env.OMIE_APP_SECRET = "test-secret";
+
+const mockFetch = vi.fn();
+global.fetch = mockFetch as any;
+
+beforeEach(async () => {
+  vi.resetModules();
+  listToolsHandler = undefined as any;
+  callToolHandler = undefined as any;
+  mockFetch.mockReset();
+  global.fetch = mockFetch as any;
+  await import("../index.js");
+});
+
+describe("mcp-omie", () => {
+  it("should register 30 tools", async () => {
+    const result = await listToolsHandler();
+    expect(result.tools).toHaveLength(30);
+  });
+
+  it("should call correct API endpoint for list_customers", async () => {
+    mockFetch.mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ clientes_cadastro: [] }) });
+
+    await callToolHandler({ params: { name: "list_customers", arguments: {} } });
+
+    const [url, opts] = mockFetch.mock.calls[0];
+    expect(url).toContain("app.omie.com.br/api/v1/geral/clientes/");
+    expect(opts.method).toBe("POST");
+    const body = JSON.parse(opts.body);
+    expect(body.call).toBe("ListarClientes");
+    expect(body.app_key).toBe("test-key");
+  });
+});

@@ -1,308 +1,53 @@
-# 🏦 omie-mcp
+# omie-mcp
 
-Servidor [MCP (Model Context Protocol)](https://modelcontextprotocol.io) para integração com o ERP **OMIE**. Permite controlar suas finanças diretamente pelo Claude (ou qualquer cliente MCP), usando linguagem natural.
+MCP server para o ERP OMIE, hospedado no Azure Web Apps com bridge OAuth para uso
+como conector remoto no Claude (claude.ai / Claude Team).
 
-## ✨ O que você pode fazer
+O servidor em si vive em [`omie/`](omie/) — Node/TypeScript, baseado em
+[`@codespar/mcp-omie`](https://github.com/codespar/mcp-dev-latam) (30 tools:
+clientes, produtos, pedidos, NF, financeiro, estoque etc.), estendido com:
 
-Converse com o Claude e peça coisas como:
+- **`omie/src/oauth.ts`** — authorization server OAuth 2.1 mínimo e stateless
+  (códigos e tokens assinados por HMAC derivado da `MCP_BRIDGE_KEY`; PKCE S256;
+  Dynamic Client Registration; allowlist de redirect).
+- **`omie/src/bridge.ts`** — Express: metadata RFC 8414/9728, `/authorize`
+  (tela de chave), `/token`, `/register`, e a guarda do `/mcp`
+  (Bearer token, `?key=` ou header `X-Bridge-Key`).
 
-- *"Liste todas as contas a pagar em aberto do mês"*
-- *"Registre o pagamento da fatura do fornecedor X"*
-- *"Mostre o extrato bancário da conta corrente de março"*
-- *"Qual o fluxo de caixa previsto vs realizado em fevereiro?"*
-- *"Cadastre um novo fornecedor com CNPJ 12.345.678/0001-99"*
+## Fluxo de vínculo no Claude
 
----
+1. Adicione `https://<app>.azurewebsites.net/mcp` como conector (sem key na URL).
+2. O Claude descobre os endpoints OAuth e abre o navegador em `/authorize`.
+3. A pessoa digita a chave (`MCP_BRIDGE_KEY`) e clica em **Vincular**.
+4. O Claude recebe um access token pessoal (1 h, renovado por refresh token
+   por até 90 dias de janela deslizante).
 
-## 🗂️ Módulos disponíveis
+Trocar a `MCP_BRIDGE_KEY` (ou `MCP_TOKEN_SECRET`) revoga todos os tokens.
 
-| Módulo | Ferramentas |
-|---|---|
-| **Fornecedores** | Listar, consultar, cadastrar e alterar fornecedores |
-| **Contas a Pagar** | Listar, consultar, incluir, lançar pagamento, cancelar e excluir |
-| **Contas a Receber** | Listar, consultar, incluir, lançar recebimento, cancelar e excluir |
-| **Lançamentos Bancários** | Listar, consultar, incluir e excluir transações em conta corrente |
-| **Contas Correntes** | Listar contas, consultar detalhes e extrato bancário por período |
-| **Fluxo de Caixa** | Previsto vs realizado, resumo financeiro, títulos em aberto e pesquisa unificada |
+## Azure Web Apps
 
-**Total: 27 ferramentas MCP**
+- **Stack**: Node 22 (Linux)
+- **Startup command**: `node dist/index.js` (ou vazio — `npm start` faz o mesmo)
+- **App settings**:
+  - `OMIE_APP_KEY` / `OMIE_APP_SECRET` — credenciais do OMIE
+  - `MCP_BRIDGE_KEY` — chave do vínculo (padrão: `omie-mcp-bridge-2026`)
+  - `SCM_DO_BUILD_DURING_DEPLOYMENT=true` — Oryx roda `npm install` + `npm run build`
+  - `MCP_ALLOWED_REDIRECT_HOSTS` (opcional) — hosts extras de callback OAuth
+  - `MCP_TOKEN_SECRET` (opcional) — rotaciona tokens sem trocar a chave
+- **Deploy**: GitHub Actions ([workflow](.github/workflows/master_omie-mcp.yml)),
+  publish profile no secret `AZURE_WEBAPP_PUBLISH_PROFILE`. O artefato publicado é
+  o conteúdo de `omie/`.
 
----
+O modo HTTP liga automaticamente quando `PORT` está definido (o App Service
+injeta). Sem `PORT`, o servidor roda em stdio — uso local via Claude Desktop
+continua funcionando como descrito em [`omie/README.md`](omie/README.md).
 
-## 📋 Pré-requisitos
-
-- Python 3.12+
-- [`uv`](https://docs.astral.sh/uv/getting-started/installation/) instalado
-- Credenciais de API do OMIE (`app_key` e `app_secret`)
-
-> Para obter as credenciais, acesse no OMIE: **Configurações → API → Aplicações**
-
----
-
-## 🚀 Instalação e uso
-
-### Opção 1 — `uvx` direto do GitHub (sem instalar nada)
-
-```bash
-uvx --from git+https://github.com/lucassampsouza/omie-mcp omie-mcp
-```
-
-As credenciais podem ser passadas por variáveis de ambiente ou por um arquivo `.env`:
+## Desenvolvimento local
 
 ```bash
-# Via variáveis de ambiente
-OMIE_APP_KEY=sua_key OMIE_APP_SECRET=seu_secret \
-  uvx --from git+https://github.com/lucassampsouza/omie-mcp omie-mcp
+cd omie
+npm install
+npm run build
+OMIE_APP_KEY=... OMIE_APP_SECRET=... PORT=3000 node dist/index.js
+# http://localhost:3000/mcp?key=omie-mcp-bridge-2026
 ```
-
-```bash
-# Via arquivo de configuração global (recomendado para uso contínuo)
-mkdir -p ~/.config/omie-mcp
-echo "OMIE_APP_KEY=sua_key"     >> ~/.config/omie-mcp/.env
-echo "OMIE_APP_SECRET=seu_secret" >> ~/.config/omie-mcp/.env
-
-uvx --from git+https://github.com/lucassampsouza/omie-mcp omie-mcp
-```
-
----
-
-### Opção 2 — Clone local com `uv`
-
-```bash
-git clone https://github.com/lucassampsouza/omie-mcp
-cd omie-mcp
-
-# Configure as credenciais
-cp .env.example .env
-# Edite o .env com sua app_key e app_secret
-
-uv run omie-mcp
-```
-
----
-
-## 🖥️ Configuração no Claude Desktop
-
-### Linux / macOS
-
-Edite o arquivo de configuração do Claude Desktop:
-
-- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
-- **Linux:** `~/.config/Claude/claude_desktop_config.json`
-
-```json
-{
-  "mcpServers": {
-    "omie": {
-      "command": "uvx",
-      "args": [
-        "--from",
-        "git+https://github.com/lucassampsouza/omie-mcp",
-        "omie-mcp"
-      ],
-      "env": {
-        "OMIE_APP_KEY": "sua_app_key",
-        "OMIE_APP_SECRET": "seu_app_secret"
-      }
-    }
-  }
-}
-```
-
----
-
-### Windows com WSL
-
-Como o Python roda dentro do WSL, a forma mais confiável é usar um script wrapper que carrega as credenciais.
-
-**1. Configure as credenciais dentro do WSL:**
-
-```bash
-mkdir -p ~/.config/omie-mcp
-cat > ~/.config/omie-mcp/.env << EOF
-OMIE_APP_KEY=sua_app_key
-OMIE_APP_SECRET=seu_app_secret
-EOF
-```
-
-**2. Crie o script wrapper** em `~/omie-mcp-run.sh`:
-
-```bash
-cat > ~/omie-mcp-run.sh << 'EOF'
-#!/bin/bash
-set -e
-export $(grep -v '^#' ~/.config/omie-mcp/.env | xargs)
-exec uvx --from git+https://github.com/lucassampsouza/omie-mcp omie-mcp
-EOF
-chmod +x ~/omie-mcp-run.sh
-```
-
-**3. Edite** `%APPDATA%\Claude\claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "omie": {
-      "command": "wsl",
-      "args": ["/home/SEU_USUARIO/omie-mcp-run.sh"]
-    }
-  }
-}
-```
-
-> Substitua `SEU_USUARIO` pelo seu usuário no WSL (rode `whoami` no terminal WSL para confirmar).
-
----
-
-## ☁️ Azure Web Apps + Claude Remote Connector
-
-Este projeto agora pode rodar como um MCP remoto em Azure Web Apps. No Azure, o servidor sobe em HTTP via Streamable HTTP; localmente, ele continua usando `stdio` para o Claude Desktop.
-
-### Passo a passo
-
-1. Crie um App Service no Azure usando Linux e Python 3.12.
-2. No App Service, configure as variáveis de ambiente `OMIE_APP_KEY` e `OMIE_APP_SECRET`.
-3. Defina o comando de inicialização como `python -m omie_mcp.server`.
-4. No Azure Entra ID, abra o App Registration ou Managed Identity usado pelo deploy.
-5. Em Federated credentials, crie uma credencial com:
-  - Issuer: `https://token.actions.githubusercontent.com`
-  - Subject: `repo:gabrieldssouza/omie-mcp:ref:refs/heads/master`
-  - Audience: `api://AzureADTokenExchange`
-6. No GitHub, confirme os secrets usados pelo workflow: `AZUREAPPSERVICE_CLIENTID_968452A927C2484AA241FE13B3FA8216`, `AZUREAPPSERVICE_TENANTID_DECA91E2E0DC4E3085B28743DABD2D10` e `AZUREAPPSERVICE_SUBSCRIPTIONID_5B0F40755FCF4593B781BBDAAB74E33C`.
-7. Faça um push na branch `master` para disparar o deploy.
-8. Depois do deploy, abra `https://SEU-APP.azurewebsites.net/mcp`.
-9. Clique em Vincular, informe a chave do bridge e use a URL liberada no conector do Claude.
-
-### Como publicar
-
-Use o comando de inicialização do App Service:
-
-```bash
-python -m omie_mcp.server
-```
-
-Se quiser mudar a chave de acesso do bridge, defina a configuração de app `MCP_BRIDGE_KEY`. Se não definir, o código usa a chave hardcoded `omie-mcp-bridge-2026`.
-
-### URL do bridge
-
-Abra `https://SEU-APP.azurewebsites.net/mcp`. A página vai pedir a chave e, ao clicar em Vincular, faz `POST /mcp` para validar o acesso e devolver a URL liberada no formato:
-
-```text
-https://SEU-APP.azurewebsites.net/mcp?key=SUA_CHAVE
-```
-
-Exemplo:
-
-```text
-https://omie-mcp.azurewebsites.net/mcp?key=omie-mcp-bridge-2026
-```
-
-Também existe um health check público em `/healthz`.
-
-### Conectar no Claude
-
-No Claude, adicione um custom connector usando a URL completa que aparece depois de clicar em Vincular na tela de `/mcp`. O endpoint aceita o segredo por query string ou pelo header `X-Bridge-Key`.
-
-### Rodar localmente em HTTP
-
-Se quiser testar o bridge localmente antes de publicar, execute:
-
-```bash
-set MCP_TRANSPORT=http
-python -m omie_mcp.server
-```
-
-No PowerShell, use:
-
-```powershell
-$env:MCP_TRANSPORT = "http"
-python -m omie_mcp.server
-```
-
----
-
-## 🔧 Referência das ferramentas
-
-### Fornecedores
-
-| Ferramenta | Descrição |
-|---|---|
-| `listar_fornecedores` | Lista fornecedores com filtros por nome ou CNPJ |
-| `consultar_fornecedor` | Consulta detalhes de um fornecedor pelo código ou CNPJ |
-| `incluir_fornecedor` | Cadastra um novo fornecedor |
-| `alterar_fornecedor` | Atualiza dados de um fornecedor existente |
-
-### Contas a Pagar
-
-| Ferramenta | Descrição |
-|---|---|
-| `listar_contas_pagar` | Lista contas filtrando por status, período e fornecedor |
-| `consultar_conta_pagar` | Consulta detalhes de uma conta específica |
-| `incluir_conta_pagar` | Cria uma nova conta a pagar |
-| `lancar_pagamento` | Registra o pagamento (baixa) de uma conta |
-| `cancelar_pagamento_conta_pagar` | Estorna o pagamento de uma conta |
-| `excluir_conta_pagar` | Exclui uma conta a pagar em aberto |
-
-### Contas a Receber
-
-| Ferramenta | Descrição |
-|---|---|
-| `listar_contas_receber` | Lista contas filtrando por status, período e cliente |
-| `consultar_conta_receber` | Consulta detalhes de uma conta específica |
-| `incluir_conta_receber` | Cria uma nova conta a receber |
-| `lancar_recebimento` | Registra o recebimento (baixa) de uma conta |
-| `cancelar_recebimento` | Estorna o recebimento de uma conta |
-| `excluir_conta_receber` | Exclui uma conta a receber em aberto |
-
-### Lançamentos Bancários
-
-| Ferramenta | Descrição |
-|---|---|
-| `listar_lancamentos_bancarios` | Lista transações de conta corrente por período |
-| `consultar_lancamento_bancario` | Consulta detalhes de um lançamento |
-| `incluir_lancamento_bancario` | Cria lançamento manual (débito ou crédito) |
-| `excluir_lancamento_bancario` | Exclui um lançamento bancário |
-
-### Contas Correntes
-
-| Ferramenta | Descrição |
-|---|---|
-| `listar_contas_correntes` | Lista todas as contas bancárias cadastradas no OMIE |
-| `consultar_conta_corrente` | Consulta detalhes de uma conta corrente específica |
-| `consultar_extrato_bancario` | Extrato completo de uma conta em um período |
-
-### Fluxo de Caixa
-
-| Ferramenta | Descrição |
-|---|---|
-| `consultar_fluxo_caixa` | Previsto vs realizado por categoria em um mês |
-| `obter_resumo_financeiro` | Resumo consolidado numa data de referência |
-| `listar_titulos_em_aberto` | Títulos não liquidados (a pagar **ou** a receber) |
-| `pesquisar_lancamentos_financeiros` | Pesquisa unificada (contas a pagar + a receber) |
-
----
-
-## 📁 Estrutura do projeto
-
-```
-omie-mcp/
-├── src/omie_mcp/
-│   ├── client.py          # Cliente HTTP para a API do OMIE
-│   ├── server.py          # Servidor MCP (FastMCP)
-│   └── tools/
-│       ├── fornecedores.py
-│       ├── contas_pagar.py
-│       ├── contas_receber.py
-│       ├── lancamentos_cc.py
-│       ├── contas_correntes.py
-│       └── fluxo_caixa.py
-├── .env.example           # Modelo de variáveis de ambiente
-├── pyproject.toml
-└── README.md
-```
-
----
-
-## 📄 Licença
-
-MIT — veja o arquivo [LICENSE](LICENSE) para detalhes.

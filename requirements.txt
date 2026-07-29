@@ -1,6 +1,0 @@
-httpx>=0.28.1
-mcp[cli]>=1.26.0,<2
-python-dotenv>=1.2.2
-uvicorn>=0.30.0
-# Instala o próprio pacote (src/omie_mcp) para que `python -m omie_mcp.server` funcione no App Service
-.
