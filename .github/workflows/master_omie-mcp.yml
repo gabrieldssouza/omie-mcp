@@ -1,6 +1,7 @@
 # Deploy do MCP server Node/TypeScript (pasta omie/) para o Azure Web App.
-# O build real acontece no App Service via Oryx (SCM_DO_BUILD_DURING_DEPLOYMENT=true):
-# npm install + npm run build. O passo de build aqui no CI é só validação antecipada.
+# O build acontece AQUI no CI: o artefato publicado já vai com dist/ compilado e
+# node_modules de produção — o App Service só executa `node dist/index.js`,
+# sem depender do build remoto do Oryx (SCM_DO_BUILD_DURING_DEPLOYMENT=false).
 
 name: Build and deploy Node app to Azure Web App - Omie-MCP
 
@@ -24,20 +25,22 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Install and build (validação)
+      - name: Install, build e podar devDependencies
         working-directory: omie
         run: |
           npm install
           npm run build
+          npm prune --omit=dev
 
       - name: Upload artifact for deployment job
         uses: actions/upload-artifact@v4
         with:
           name: node-app
+          include-hidden-files: true
           path: |
-            omie
-            !omie/node_modules
-            !omie/dist
+            omie/dist
+            omie/node_modules
+            omie/package.json
 
   deploy:
     runs-on: ubuntu-latest
