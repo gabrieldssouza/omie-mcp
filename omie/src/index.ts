@@ -13,7 +13,7 @@
  * - create_product: Create a product
  * - create_order: Create a sales order
  * - list_orders: List sales orders
- * - list_invoices: List invoices (NF)
+ * - list_service_invoices: List issued service invoices (NFS-e)
  * - get_financial: List accounts receivable
  * - create_invoice: Consult a specific NF
  * - get_company_info: List companies
@@ -186,15 +186,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
-      name: "list_invoices",
-      description: "List invoices (NF) from Omie ERP",
+      name: "list_service_invoices",
+      description:
+        "List issued SERVICE invoices (NFS-e) from Omie ERP. Use this whenever the user asks " +
+        "about 'notas emitidas', 'notas fiscais de serviço' or issued invoices — for service " +
+        "companies these are NFS-e, not product NF-e. Supports filtering by emission period " +
+        "and by client (nCodigoCliente, from list_customers).",
       inputSchema: {
         type: "object",
         properties: {
-          pagina: { type: "number", description: "Page number (default 1)" },
-          registros_por_pagina: { type: "number", description: "Records per page (default 50)" },
+          nPagina: { type: "number", description: "Page number (default 1)" },
+          nRegPorPagina: { type: "number", description: "Records per page (default 50)" },
           dEmiInicial: { type: "string", description: "Start emission date (DD/MM/YYYY)" },
           dEmiFinal: { type: "string", description: "End emission date (DD/MM/YYYY)" },
+          nCodigoCliente: { type: "number", description: "Filter by Omie client ID (from list_customers)" },
+          nCodigoOS: { type: "number", description: "Filter by service order (OS) ID" },
+          cStatusNFSe: { type: "string", description: "Status filter: C=cancelada, F=faturada, N=não faturada" },
         },
       },
     },
@@ -547,12 +554,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           registros_por_pagina: args?.registros_por_pagina || 50,
           ...(args?.etapa ? { etapa: args.etapa } : {}),
         }]), null, 2) }] };
-      case "list_invoices":
-        return { content: [{ type: "text", text: JSON.stringify(await omieRequest("/produtos/nfconsultar/", "ListarNF", [{
-          pagina: args?.pagina || 1,
-          registros_por_pagina: args?.registros_por_pagina || 50,
+      case "list_service_invoices":
+        return { content: [{ type: "text", text: JSON.stringify(await omieRequest("/servicos/nfse/", "ListarNFSEs", [{
+          nPagina: args?.nPagina || 1,
+          nRegPorPagina: args?.nRegPorPagina || 50,
           ...(args?.dEmiInicial ? { dEmiInicial: args.dEmiInicial } : {}),
           ...(args?.dEmiFinal ? { dEmiFinal: args.dEmiFinal } : {}),
+          ...(args?.nCodigoCliente ? { nCodigoCliente: args.nCodigoCliente } : {}),
+          ...(args?.nCodigoOS ? { nCodigoOS: args.nCodigoOS } : {}),
+          ...(args?.cStatusNFSe ? { cStatusNFSe: args.cStatusNFSe } : {}),
         }]), null, 2) }] };
       case "get_financial":
         return { content: [{ type: "text", text: JSON.stringify(await omieRequest("/financas/contareceber/", "ListarContasReceber", [{
