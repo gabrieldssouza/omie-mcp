@@ -1,55 +1,40 @@
 /**
  * HTTP bridge for Azure Web Apps: wraps the MCP streamable-HTTP endpoint with
- * the OAuth 2.1 authorization server from oauth.ts.
+ * the OAuth 2.1 authorization server from oauth.ts, which delegates the login
+ * to Microsoft Entra ID (entra.ts).
  *
- * Auth accepted on /mcp, in order:
- *   1. OAuth Bearer token (what claude.ai uses after the /authorize link flow)
- *   2. Direct key via ?key= or X-Bridge-Key header (own use / quick tests)
+ * Link flow when someone clicks "Connect" in Claude:
+ *   Claude → /authorize → Microsoft SSO → /auth/callback (group check)
+ *   → Claude's redirect_uri with a code → /token → Bearer token on /mcp.
  *
- * Everything else (metadata, /register, /authorize, /token) implements the
- * discovery + link flow remote MCP clients expect.
+ * /mcp only accepts that Bearer token — there is no shared key anymore.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { Request, Response, Express } from "express";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 
-import { INFO_PAGE, OAuthError, OAuthProvider, SCOPE, renderLoginPage } from "./oauth.js";
+import { EntraClient, EntraError, describeEntraError, pkcePair } from "./entra.js";
+import { INFO_PAGE, OAuthError, OAuthProvider, SCOPE, renderPage } from "./oauth.js";
+import type { PendingAuthorization } from "./oauth.js";
 
 const BRIDGE_PATH = "/mcp";
-
-const AUTHORIZE_FIELDS = [
-  "client_id",
-  "redirect_uri",
-  "state",
-  "code_challenge",
-  "code_challenge_method",
-  "scope",
-  "resource",
-  "response_type",
-] as const;
-
-interface AuthorizeParams {
-  response_type: string;
-  client_id: string;
-  redirect_uri: string;
-  state: string;
-  code_challenge: string;
-  code_challenge_method: string;
-  scope: string;
-  resource: string;
-}
+const CALLBACK_PATH = "/auth/callback";
+const LOGIN_COOKIE = "omie_mcp_login";
 
 function first(value: unknown): string {
   if (Array.isArray(value)) return typeof value[0] === "string" ? value[0] : "";
   return typeof value === "string" ? value : "";
 }
 
-/** Public base URL. On App Service TLS terminates at the front end, so the
- *  real scheme arrives in X-Forwarded-Proto. */
+/** Public base URL. MCP_PUBLIC_URL pins it (it must match the redirect URI
+ *  registered in Entra); otherwise on App Service TLS terminates at the front
+ *  end, so the real scheme arrives in X-Forwarded-Proto. */
 function baseUrl(req: Request): string {
+  const pinned = (process.env.MCP_PUBLIC_URL || "").trim().replace(/\/+$/, "");
+  if (pinned) return pinned;
   const forwardedProto = first(req.headers["x-forwarded-proto"]).split(",")[0].trim();
   const scheme = forwardedProto || req.protocol || "http";
   const forwardedHost = first(req.headers["x-forwarded-host"]).split(",")[0].trim();
@@ -62,41 +47,33 @@ function isHtmlRequest(req: Request): boolean {
   return accept.includes("text/html") && !accept.includes("application/json") && !accept.includes("text/event-stream");
 }
 
+function readCookie(req: Request, name: string): string {
+  for (const part of first(req.headers.cookie).split(";")) {
+    const eq = part.indexOf("=");
+    if (eq > 0 && part.slice(0, eq).trim() === name) return decodeURIComponent(part.slice(eq + 1).trim());
+  }
+  return "";
+}
+
+function sha256(text: string): string {
+  return createHash("sha256").update(text, "utf8").digest("base64url");
+}
+
 export function installBridge(app: Express, createSession: () => Promise<Server>): void {
-  const bridgeKey = process.env.MCP_BRIDGE_KEY || "omie-mcp-bridge-2026";
-  const oauth = new OAuthProvider(bridgeKey);
+  const entra = new EntraClient();
+  const tokenSecret = process.env.MCP_TOKEN_SECRET || process.env.AZURE_CLIENT_SECRET || "";
+  const oauth = new OAuthProvider(tokenSecret);
   const transports = new Map<string, StreamableHTTPServerTransport>();
 
   const validAudiences = (base: string) => new Set([base, `${base}${BRIDGE_PATH}`, `${base}${BRIDGE_PATH}/`]);
 
-  const authorizeParams = (source: Record<string, unknown>, base: string): AuthorizeParams => ({
-    response_type: first(source.response_type) || "code",
-    client_id: first(source.client_id),
-    redirect_uri: first(source.redirect_uri),
-    state: first(source.state),
-    code_challenge: first(source.code_challenge),
-    code_challenge_method: first(source.code_challenge_method),
-    scope: first(source.scope) || SCOPE,
-    resource: first(source.resource) || `${base}${BRIDGE_PATH}`,
-  });
-
-  /** Returns an error message when the request cannot even be redirected. */
-  const validateAuthorize = (params: AuthorizeParams): string => {
-    if (!params.redirect_uri) return "redirect_uri is required.";
-    if (!oauth.isRedirectAllowed(params.redirect_uri)) {
-      return (
-        `redirect_uri not allowed: ${params.redirect_uri}. ` +
-        "Set MCP_ALLOWED_REDIRECT_HOSTS if this client is legitimate."
-      );
-    }
-    if (!oauth.redirectUriMatchesClient(params.client_id, params.redirect_uri)) {
-      return "redirect_uri does not match the one registered for this client_id.";
-    }
-    return "";
+  const errorPage = (res: Response, status: number, message: string): void => {
+    res
+      .status(status)
+      .setHeader("Cache-Control", "no-store")
+      .type("html")
+      .send(renderPage("Não foi possível vincular", [message], true));
   };
-
-  const hiddenFields = (params: AuthorizeParams): Record<string, string> =>
-    Object.fromEntries(AUTHORIZE_FIELDS.map((name) => [name, params[name]]));
 
   // ------------------------------------------------------------------ CORS
 
@@ -106,10 +83,7 @@ export function installBridge(app: Express, createSession: () => Promise<Server>
       res
         .status(204)
         .setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-        .setHeader(
-          "Access-Control-Allow-Headers",
-          "content-type, authorization, mcp-session-id, mcp-protocol-version, x-bridge-key",
-        )
+        .setHeader("Access-Control-Allow-Headers", "content-type, authorization, mcp-session-id, mcp-protocol-version")
         .setHeader("Access-Control-Max-Age", "86400")
         .end();
       return;
@@ -169,129 +143,184 @@ export function installBridge(app: Express, createSession: () => Promise<Server>
 
   // -------------------------------------------------------------- authorize
 
+  /** Claude's /authorize request: validate it, park it in a sealed state and
+   *  send the browser to the Microsoft login. */
   app.get("/authorize", (req, res) => {
     const base = baseUrl(req);
-    const params = authorizeParams(req.query as Record<string, unknown>, base);
+    const query = req.query as Record<string, unknown>;
+    const responseType = first(query.response_type) || "code";
+    const codeChallengeMethod = first(query.code_challenge_method);
+    const pending: PendingAuthorization = {
+      clientId: first(query.client_id),
+      redirectUri: first(query.redirect_uri),
+      state: first(query.state),
+      codeChallenge: first(query.code_challenge),
+      resource: first(query.resource) || `${base}${BRIDGE_PATH}`,
+      scope: first(query.scope) || SCOPE,
+    };
 
-    const problem = validateAuthorize(params);
-    if (problem) {
-      res.status(400).type("text/plain").send(problem);
+    // Nothing may be redirected back until the redirect_uri itself is trusted.
+    if (!pending.redirectUri) {
+      res.status(400).type("text/plain").send("redirect_uri is required.");
       return;
     }
-    if (params.response_type !== "code") {
-      res.redirect(
-        302,
-        oauth.authorizationRedirect(params.redirect_uri, {
-          error: "unsupported_response_type",
-          iss: base,
-          ...(params.state ? { state: params.state } : {}),
-        }),
-      );
-      return;
-    }
-    if (params.code_challenge && params.code_challenge_method && params.code_challenge_method !== "S256") {
-      res.redirect(
-        302,
-        oauth.authorizationRedirect(params.redirect_uri, {
-          error: "invalid_request",
-          iss: base,
-          ...(params.state ? { state: params.state } : {}),
-        }),
-      );
-      return;
-    }
-
-    res
-      .status(200)
-      .setHeader("Cache-Control", "no-store")
-      .type("html")
-      .send(renderLoginPage({ action: `${base}/authorize`, hidden: hiddenFields(params) }));
-  });
-
-  app.post("/authorize", (req, res) => {
-    const base = baseUrl(req);
-    const form = (req.body ?? {}) as Record<string, unknown>;
-    const params = authorizeParams(form, base);
-
-    const problem = validateAuthorize(params);
-    if (problem) {
-      res.status(400).type("text/plain").send(problem);
-      return;
-    }
-
-    if (!oauth.checkKey(first(form.key))) {
+    if (!oauth.isRedirectAllowed(pending.redirectUri)) {
       res
-        .status(401)
-        .setHeader("Cache-Control", "no-store")
-        .type("html")
+        .status(400)
+        .type("text/plain")
         .send(
-          renderLoginPage({
-            action: `${base}/authorize`,
-            hidden: hiddenFields(params),
-            error: "Chave incorreta. Tente novamente.",
-          }),
+          `redirect_uri not allowed: ${pending.redirectUri}. ` +
+            "Set MCP_ALLOWED_REDIRECT_HOSTS if this client is legitimate.",
         );
       return;
     }
+    if (!oauth.redirectUriMatchesClient(pending.clientId, pending.redirectUri)) {
+      res.status(400).type("text/plain").send("redirect_uri does not match the one registered for this client_id.");
+      return;
+    }
 
-    const code = oauth.issueCode({
-      clientId: params.client_id,
-      redirectUri: params.redirect_uri,
-      codeChallenge: params.code_challenge,
-      resource: params.resource,
-      scope: params.scope,
+    const fail = (error: string) =>
+      res.redirect(
+        302,
+        oauth.authorizationRedirect(pending.redirectUri, {
+          error,
+          iss: base,
+          ...(pending.state ? { state: pending.state } : {}),
+        }),
+      );
+    if (responseType !== "code") return fail("unsupported_response_type");
+    if (pending.codeChallenge && codeChallengeMethod && codeChallengeMethod !== "S256") return fail("invalid_request");
+
+    // Binds the login to this browser: the callback must present the cookie.
+    const browserNonce = randomBytes(24).toString("base64url");
+    const pkce = pkcePair();
+    const nonce = randomBytes(16).toString("base64url");
+    const state = oauth.issueLoginState({
+      pending,
+      entraVerifier: pkce.verifier,
+      nonce,
+      browser: sha256(browserNonce),
     });
-    res.redirect(
-      302,
-      oauth.authorizationRedirect(params.redirect_uri, {
-        code,
+
+    res.cookie(LOGIN_COOKIE, browserNonce, {
+      httpOnly: true,
+      secure: base.startsWith("https://"),
+      sameSite: "lax",
+      path: CALLBACK_PATH,
+      maxAge: 10 * 60 * 1000,
+    });
+    res
+      .setHeader("Cache-Control", "no-store")
+      .redirect(
+        302,
+        entra.authorizeUrl({ redirectUri: `${base}${CALLBACK_PATH}`, state, nonce, codeChallenge: pkce.challenge }),
+      );
+  });
+
+  /** Microsoft redirects here after the SSO. On success the user goes back to
+   *  Claude with our authorization code. */
+  app.get(CALLBACK_PATH, async (req, res) => {
+    const base = baseUrl(req);
+    const query = req.query as Record<string, unknown>;
+    res.clearCookie(LOGIN_COOKIE, { path: CALLBACK_PATH });
+
+    const login = oauth.openLoginState(first(query.state));
+    if (!login) {
+      errorPage(res, 400, "O link de login expirou ou é inválido. Volte ao Claude e clique em Conectar novamente.");
+      return;
+    }
+    const browserNonce = readCookie(req, LOGIN_COOKIE);
+    if (!browserNonce || sha256(browserNonce) !== login.browser) {
+      errorPage(res, 400, "Este login foi iniciado em outro navegador. Volte ao Claude e clique em Conectar novamente.");
+      return;
+    }
+
+    const { pending } = login;
+    const backToClaude = (params: Record<string, string>) =>
+      oauth.authorizationRedirect(pending.redirectUri, {
+        ...params,
         iss: base,
-        ...(params.state ? { state: params.state } : {}),
-      }),
-    );
+        ...(pending.state ? { state: pending.state } : {}),
+      });
+
+    const entraError = first(query.error);
+    if (entraError) {
+      const description = first(query.error_description);
+      console.error(`SSO recusado: ${entraError} ${description}`);
+      errorPage(res, 403, describeEntraError(entraError, description));
+      return;
+    }
+
+    try {
+      const result = await entra.redeemCode({
+        code: first(query.code),
+        redirectUri: `${base}${CALLBACK_PATH}`,
+        codeVerifier: login.entraVerifier,
+        nonce: login.nonce,
+      });
+      console.error(`SSO ok: ${result.identity.email}`);
+      const code = oauth.issueCode(pending, result.identity, result.refreshToken);
+      res.setHeader("Cache-Control", "no-store").redirect(302, backToClaude({ code }));
+    } catch (err) {
+      if (err instanceof EntraError) {
+        console.error(`SSO negado: ${err.code} ${err.message}`);
+        errorPage(res, 403, err.code === "access_denied" ? describeEntraError(err.code, err.message) : err.message);
+      } else {
+        console.error("SSO falhou:", err);
+        errorPage(res, 502, "Falha ao falar com a Microsoft. Tente novamente em instantes.");
+      }
+    }
   });
 
   // ------------------------------------------------------------------ token
 
-  app.post("/token", (req, res) => {
+  app.post("/token", async (req, res) => {
     res.setHeader("Cache-Control", "no-store");
     const form = (req.body ?? {}) as Record<string, unknown>;
     const grantType = first(form.grant_type);
 
     try {
       if (grantType === "authorization_code") {
-        const payload = oauth.redeemCode({
+        const grant = oauth.redeemCode({
           code: first(form.code),
           codeVerifier: first(form.code_verifier),
           redirectUri: first(form.redirect_uri),
         });
-        const audience = typeof payload.aud === "string" ? payload.aud : `${baseUrl(req)}${BRIDGE_PATH}`;
-        const scope = typeof payload.scope === "string" ? payload.scope : SCOPE;
-        res.json(oauth.issueTokens(audience, scope));
+        const audience = grant.audience || `${baseUrl(req)}${BRIDGE_PATH}`;
+        res.json(oauth.issueTokens(audience, grant.scope, grant.identity, grant.entraRefreshToken));
       } else if (grantType === "refresh_token") {
-        res.json(oauth.refreshTokens(first(form.refresh_token)));
+        const grant = oauth.openRefreshToken(first(form.refresh_token));
+        // Ask Entra again: a user removed from the group loses access here.
+        let renewed;
+        try {
+          renewed = await entra.refresh(grant.entraRefreshToken);
+        } catch (err) {
+          if (err instanceof EntraError) {
+            console.error(`Refresh negado para ${grant.identity.email}: ${err.code} ${err.message}`);
+            throw new OAuthError("invalid_grant", "sessão Microsoft expirada ou sem acesso; vincule novamente");
+          }
+          throw err;
+        }
+        res.json(oauth.issueTokens(grant.audience, grant.scope, renewed.identity, renewed.refreshToken));
       } else {
         throw new OAuthError("unsupported_grant_type", `unsupported grant_type: ${grantType || "(empty)"}`);
       }
     } catch (err) {
       if (err instanceof OAuthError) res.status(err.status).json(err.toJSON());
-      else res.status(500).json({ error: "server_error" });
+      else {
+        console.error("Erro no /token:", err);
+        res.status(500).json({ error: "server_error" });
+      }
     }
   });
 
   // --------------------------------------------------------- /mcp endpoint
 
   const isAuthorized = (req: Request): boolean => {
-    const queryKey = first((req.query as Record<string, unknown>).key);
-    const headerKey = first(req.headers["x-bridge-key"]);
-    if ((queryKey && oauth.checkKey(queryKey)) || (headerKey && oauth.checkKey(headerKey))) return true;
-
     const authorization = first(req.headers.authorization);
-    if (authorization.toLowerCase().startsWith("bearer ")) {
-      const token = authorization.slice(7).trim();
-      return oauth.verifyAccessToken(token, validAudiences(baseUrl(req)));
-    }
-    return false;
+    if (!authorization.toLowerCase().startsWith("bearer ")) return false;
+    const token = authorization.slice(7).trim();
+    return oauth.verifyAccessToken(token, validAudiences(baseUrl(req))) !== null;
   };
 
   const deny = (req: Request, res: Response): void => {

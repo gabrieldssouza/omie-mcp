@@ -1,6 +1,6 @@
 # omie-mcp
 
-MCP server para o ERP OMIE, hospedado no Azure Web Apps com bridge OAuth para uso
+MCP server para o ERP OMIE, hospedado no Azure Web Apps com login SSO Microsoft para uso
 como conector remoto no Claude (claude.ai / Claude Team).
 
 O servidor em si vive em [`omie/`](omie/) — Node/TypeScript, baseado em
@@ -8,21 +8,39 @@ O servidor em si vive em [`omie/`](omie/) — Node/TypeScript, baseado em
 clientes, produtos, pedidos, NF, financeiro, estoque etc.), estendido com:
 
 - **`omie/src/oauth.ts`** — authorization server OAuth 2.1 mínimo e stateless
-  (códigos e tokens assinados por HMAC derivado da `MCP_BRIDGE_KEY`; PKCE S256;
-  Dynamic Client Registration; allowlist de redirect).
+  (state, códigos e tokens selados com AES-256-GCM; PKCE S256; Dynamic Client
+  Registration; allowlist de redirect).
+- **`omie/src/entra.ts`** — login SSO no Microsoft Entra ID e checagem do grupo.
 - **`omie/src/bridge.ts`** — Express: metadata RFC 8414/9728, `/authorize`
-  (tela de chave), `/token`, `/register`, e a guarda do `/mcp`
-  (Bearer token, `?key=` ou header `X-Bridge-Key`).
+  (redireciona para a Microsoft), `/auth/callback`, `/token`, `/register`, e a
+  guarda do `/mcp` (só Bearer token — não existe mais chave compartilhada).
 
 ## Fluxo de vínculo no Claude
 
-1. Adicione `https://<app>.azurewebsites.net/mcp` como conector (sem key na URL).
-2. O Claude descobre os endpoints OAuth e abre o navegador em `/authorize`.
-3. A pessoa digita a chave (`MCP_BRIDGE_KEY`) e clica em **Vincular**.
-4. O Claude recebe um access token pessoal (1 h, renovado por refresh token
-   por até 90 dias de janela deslizante).
+1. Adicione `https://<app>.azurewebsites.net/mcp` como conector.
+2. A pessoa clica em **Conectar**; o Claude abre `/authorize`, que manda o
+   navegador para a tela de login da Microsoft.
+3. Depois do login, `/auth/callback` confere se a conta está no grupo
+   **Omie-MCP** e devolve o código para o Claude.
+4. O Claude recebe um access token pessoal (1 h). A cada renovação o servidor
+   consulta a Microsoft de novo: quem sair do grupo perde o acesso em até 1 h.
 
-Trocar a `MCP_BRIDGE_KEY` (ou `MCP_TOKEN_SECRET`) revoga todos os tokens.
+O acesso é barrado em dois lugares: no Entra (enterprise app com *Assignment
+required* e só o grupo atribuído — quem está fora recebe AADSTS50105 na própria
+tela da Microsoft) e no servidor (claim `groups` precisa conter
+`AZURE_ALLOWED_GROUP_IDS`, ou o e-mail estar em `AZURE_ALLOWED_EMAILS`).
+
+## Entra ID
+
+App registration **Omie-MCP** (single tenant):
+
+- Redirect URI (Web): `https://<app>.azurewebsites.net/auth/callback`
+- Client secret → `AZURE_CLIENT_SECRET`
+- Manifest: `"groupMembershipClaims": "ApplicationGroup"` (o token só traz os
+  grupos atribuídos ao app, evitando o limite de grupos no token)
+- Enterprise app: *Assignment required* = Sim; grupo **Omie-MCP** atribuído
+
+Para dar ou tirar acesso, basta incluir ou remover a pessoa do grupo.
 
 ## Azure Web Apps
 
@@ -30,10 +48,12 @@ Trocar a `MCP_BRIDGE_KEY` (ou `MCP_TOKEN_SECRET`) revoga todos os tokens.
 - **Startup command**: `node dist/index.js` (ou vazio — `npm start` faz o mesmo)
 - **App settings**:
   - `OMIE_APP_KEY` / `OMIE_APP_SECRET` — credenciais do OMIE
-  - `MCP_BRIDGE_KEY` — chave do vínculo (padrão: `omie-mcp-bridge-2026`)
-  - `SCM_DO_BUILD_DURING_DEPLOYMENT=true` — Oryx roda `npm install` + `npm run build`
+  - `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` — app registration
+  - `AZURE_ALLOWED_GROUP_IDS` — object ID do grupo Omie-MCP
+  - `AZURE_ALLOWED_EMAILS` (opcional) — e-mails liberados fora do grupo
+  - `MCP_PUBLIC_URL` (opcional) — fixa a URL pública usada no redirect URI
+  - `MCP_TOKEN_SECRET` (opcional) — rotaciona todos os tokens emitidos
   - `MCP_ALLOWED_REDIRECT_HOSTS` (opcional) — hosts extras de callback OAuth
-  - `MCP_TOKEN_SECRET` (opcional) — rotaciona tokens sem trocar a chave
 - **Deploy**: GitHub Actions ([workflow](.github/workflows/master_omie-mcp.yml)),
   publish profile no secret `AZURE_WEBAPP_PUBLISH_PROFILE`. O artefato publicado é
   o conteúdo de `omie/`.
@@ -48,6 +68,7 @@ continua funcionando como descrito em [`omie/README.md`](omie/README.md).
 cd omie
 npm install
 npm run build
-OMIE_APP_KEY=... OMIE_APP_SECRET=... PORT=3000 node dist/index.js
-# http://localhost:3000/mcp?key=omie-mcp-bridge-2026
+cp ../.env.example .env  # preencha, e adicione http://localhost:3000/auth/callback no app registration
+node --env-file=.env dist/index.js   # PORT=3000 no .env
+# conecte http://localhost:3000/mcp no MCP Inspector
 ```

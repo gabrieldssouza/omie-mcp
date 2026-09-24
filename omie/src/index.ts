@@ -699,7 +699,7 @@ async function main() {
     const { installBridge } = await import("./bridge.js");
     const app = express();
     app.use(express.json());
-    // /authorize (login form) and /token post as application/x-www-form-urlencoded.
+    // /token posts as application/x-www-form-urlencoded.
     app.use(express.urlencoded({ extended: false }));
     installBridge(app, createSession);
     const port = Number(process.env.PORT) || Number(process.env.MCP_PORT) || 3000;

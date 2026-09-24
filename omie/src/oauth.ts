@@ -1,30 +1,31 @@
 /**
  * Minimal OAuth 2.1 authorization server for the HTTP bridge.
  *
- * Remote MCP clients (claude.ai included) authenticate via OAuth, not via a key
- * in the URL. This module turns the bridge-key screen into an authorization
- * endpoint: each user types the key in the browser and the client receives a
- * personal access token. The key never travels in the connector URL, so the
- * same URL can be distributed to a whole organization — only people who know
- * the key can complete the link.
+ * Remote MCP clients (claude.ai included) need an authorization server that
+ * supports Dynamic Client Registration, which Microsoft Entra ID does not. So
+ * the bridge is its own authorization server facing Claude, and delegates the
+ * actual login to Entra (see entra.ts): /authorize sends the browser to the
+ * Microsoft SSO screen, and only members of the allowed group get a code back.
  *
- * Everything is stateless — codes and tokens are HMAC-signed with a secret
- * derived from MCP_BRIDGE_KEY, so they survive restarts and multiple App
- * Service instances without external storage. Rotating MCP_BRIDGE_KEY (or
- * MCP_TOKEN_SECRET) invalidates every issued token, which is the intended
- * revocation mechanism.
+ * Everything is stateless — state, codes and tokens are AES-256-GCM sealed
+ * with a key derived from MCP_TOKEN_SECRET (or AZURE_CLIENT_SECRET), so they
+ * survive restarts and multiple App Service instances without storage. The
+ * Entra refresh token travels sealed inside ours, which lets every refresh
+ * re-check the user with Entra: removing someone from the group cuts access
+ * within one access-token lifetime. Rotating the secret revokes everything.
  *
  * References: OAuth 2.1, RFC 7591 (dynamic client registration), RFC 8414
  * (AS metadata), RFC 8707 (resource indicators), RFC 9207 (iss parameter),
  * RFC 9728 (protected resource metadata).
  */
 
-import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
 export const SCOPE = "omie";
 export const ACCESS_TOKEN_TTL = 3600;
 export const REFRESH_TOKEN_TTL = 90 * 24 * 3600;
 export const AUTH_CODE_TTL = 300;
+export const LOGIN_STATE_TTL = 600;
 
 /** Hosts the authorization endpoint may redirect back to after the link.
  *  Restricting this is what keeps /authorize from being an open redirector. */
@@ -51,6 +52,13 @@ export class OAuthError extends Error {
   }
 }
 
+/** Who completed the Microsoft login. */
+export interface Identity {
+  sub: string;
+  email: string;
+  name: string;
+}
+
 function b64u(raw: Buffer): string {
   return raw.toString("base64url");
 }
@@ -59,32 +67,34 @@ function now(): number {
   return Math.floor(Date.now() / 1000);
 }
 
-export function deriveSecret(bridgeKey: string): Buffer {
-  // MCP_TOKEN_SECRET lets you rotate tokens without changing the key users type.
-  const extra = process.env.MCP_TOKEN_SECRET || "";
-  return createHash("sha256").update(`omie-mcp\0${bridgeKey}\0${extra}`, "utf8").digest();
+export function deriveKey(secret: string): Buffer {
+  return createHash("sha256").update(`omie-mcp\0${secret}`, "utf8").digest();
 }
 
-function sign(payload: Record<string, unknown>, secret: Buffer): string {
-  const body = b64u(Buffer.from(JSON.stringify(payload, Object.keys(payload).sort()), "utf8"));
-  const signature = b64u(createHmac("sha256", secret).update(body, "ascii").digest());
-  return `${body}.${signature}`;
+/** AES-256-GCM: authenticated and confidential, since codes and refresh
+ *  tokens carry the user's Entra refresh token. */
+function seal(payload: Record<string, unknown>, key: Buffer): string {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  const body = Buffer.concat([cipher.update(JSON.stringify(payload), "utf8"), cipher.final()]);
+  return b64u(Buffer.concat([iv, cipher.getAuthTag(), body]));
 }
 
-function unsign(token: string, secret: Buffer, expectedTyp: string): Record<string, unknown> | null {
-  const dot = token.indexOf(".");
-  if (dot <= 0 || dot === token.length - 1) return null;
-  const body = token.slice(0, dot);
-  const signature = token.slice(dot + 1);
-
-  const expected = b64u(createHmac("sha256", secret).update(body, "ascii").digest());
-  const sigBuf = Buffer.from(signature, "utf8");
-  const expBuf = Buffer.from(expected, "utf8");
-  if (sigBuf.length !== expBuf.length || !timingSafeEqual(sigBuf, expBuf)) return null;
+function unseal(token: string, key: Buffer, expectedTyp: string): Record<string, unknown> | null {
+  let raw: Buffer;
+  try {
+    raw = Buffer.from(token, "base64url");
+  } catch {
+    return null;
+  }
+  if (raw.length < 29) return null;
 
   let payload: unknown;
   try {
-    payload = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
+    const decipher = createDecipheriv("aes-256-gcm", key, raw.subarray(0, 12));
+    decipher.setAuthTag(raw.subarray(12, 28));
+    const plain = Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]);
+    payload = JSON.parse(plain.toString("utf8"));
   } catch {
     return null;
   }
@@ -93,6 +103,14 @@ function unsign(token: string, secret: Buffer, expectedTyp: string): Record<stri
   if (record.typ !== expectedTyp) return null;
   if (typeof record.exp !== "number" || record.exp <= now()) return null;
   return record;
+}
+
+function str(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function identityOf(payload: Record<string, unknown>): Identity {
+  return { sub: str(payload.sub), email: str(payload.email), name: str(payload.name) };
 }
 
 function allowedRedirectHosts(): Set<string> {
@@ -114,13 +132,32 @@ export interface TokenSet {
   scope: string;
 }
 
+/** The /authorize request Claude made, parked while the user is at Microsoft. */
+export interface PendingAuthorization {
+  clientId: string;
+  redirectUri: string;
+  state: string;
+  codeChallenge: string;
+  resource: string;
+  scope: string;
+}
+
+export interface LoginState {
+  pending: PendingAuthorization;
+  /** PKCE verifier and nonce of the leg between the bridge and Entra. */
+  entraVerifier: string;
+  nonce: string;
+  /** Hash of the browser-binding cookie, so a state can't be replayed elsewhere. */
+  browser: string;
+}
+
 /** Issues and validates bridge credentials. No in-memory state. */
 export class OAuthProvider {
-  private secret: Buffer;
+  private key: Buffer;
   private allowedHosts: Set<string>;
 
-  constructor(private bridgeKey: string) {
-    this.secret = deriveSecret(bridgeKey);
+  constructor(secret: string) {
+    this.key = deriveKey(secret);
     this.allowedHosts = allowedRedirectHosts();
   }
 
@@ -153,7 +190,7 @@ export class OAuthProvider {
 
   // ------------------------------------------- dynamic client registration
 
-  /** RFC 7591. The client_id is a signed blob embedding the redirect_uris, so
+  /** RFC 7591. The client_id is a sealed blob embedding the redirect_uris, so
    *  no registration storage is needed to validate the redirect later. */
   registerClient(request: Record<string, unknown>): Record<string, unknown> {
     const redirectUris = request.redirect_uris;
@@ -167,15 +204,15 @@ export class OAuthProvider {
     }
 
     const issuedAt = now();
-    const clientId = sign(
+    const clientId = seal(
       {
         typ: "client",
         ru: redirectUris,
         iat: issuedAt,
-        // client_id never really expires, but unsign() requires exp.
+        // client_id never really expires, but unseal() requires exp.
         exp: issuedAt + 10 * 365 * 24 * 3600,
       },
-      this.secret,
+      this.key,
     );
 
     const response: Record<string, unknown> = {
@@ -211,45 +248,59 @@ export class OAuthProvider {
   /** If we issued the client_id, the redirect must be among the registered
    *  ones. Foreign client_ids fall back to the host allowlist alone. */
   redirectUriMatchesClient(clientId: string, redirectUri: string): boolean {
-    const payload = unsign(clientId, this.secret, "client");
+    const payload = unseal(clientId, this.key, "client");
     if (payload === null) return true;
     const registered = payload.ru;
     return Array.isArray(registered) && registered.includes(redirectUri);
   }
 
+  // ------------------------------------------------------------ login state
+
+  /** The `state` sent to Entra. Sealed because it carries the PKCE verifier. */
+  issueLoginState(state: LoginState): string {
+    return seal({ typ: "login", ...state, exp: now() + LOGIN_STATE_TTL }, this.key);
+  }
+
+  openLoginState(token: string): LoginState | null {
+    const payload = unseal(token, this.key, "login");
+    if (payload === null) return null;
+    return payload as unknown as LoginState;
+  }
+
   // -------------------------------------------------------------- auth code
 
-  issueCode(opts: {
-    clientId: string;
-    redirectUri: string;
-    codeChallenge: string;
-    resource: string;
-    scope: string;
-  }): string {
-    return sign(
+  issueCode(pending: PendingAuthorization, identity: Identity, entraRefreshToken: string): string {
+    return seal(
       {
         typ: "code",
-        cid: opts.clientId,
-        ru: opts.redirectUri,
-        cc: opts.codeChallenge,
-        aud: opts.resource,
-        scope: opts.scope,
+        cid: pending.clientId,
+        ru: pending.redirectUri,
+        cc: pending.codeChallenge,
+        aud: pending.resource,
+        scope: pending.scope,
+        ...identity,
+        ert: entraRefreshToken,
         jti: randomBytes(8).toString("base64url"),
         exp: now() + AUTH_CODE_TTL,
       },
-      this.secret,
+      this.key,
     );
   }
 
-  redeemCode(opts: { code: string; codeVerifier: string; redirectUri: string }): Record<string, unknown> {
-    const payload = unsign(opts.code, this.secret, "code");
+  redeemCode(opts: { code: string; codeVerifier: string; redirectUri: string }): {
+    audience: string;
+    scope: string;
+    identity: Identity;
+    entraRefreshToken: string;
+  } {
+    const payload = unseal(opts.code, this.key, "code");
     if (payload === null) throw new OAuthError("invalid_grant", "invalid or expired code");
 
     if (opts.redirectUri && opts.redirectUri !== payload.ru) {
       throw new OAuthError("invalid_grant", "redirect_uri does not match the code");
     }
 
-    const challenge = typeof payload.cc === "string" ? payload.cc : "";
+    const challenge = str(payload.cc);
     if (challenge) {
       if (!opts.codeVerifier) throw new OAuthError("invalid_request", "code_verifier is required");
       const digest = b64u(createHash("sha256").update(opts.codeVerifier, "ascii").digest());
@@ -259,15 +310,26 @@ export class OAuthProvider {
         throw new OAuthError("invalid_grant", "code_verifier does not match code_challenge");
       }
     }
-    return payload;
+    return {
+      audience: str(payload.aud),
+      scope: str(payload.scope) || SCOPE,
+      identity: identityOf(payload),
+      entraRefreshToken: str(payload.ert),
+    };
   }
 
   // ----------------------------------------------------------------- tokens
 
-  issueTokens(audience: string, scope: string): TokenSet {
+  issueTokens(audience: string, scope: string, identity: Identity, entraRefreshToken: string): TokenSet {
     const iat = now();
-    const access = sign({ typ: "at", aud: audience, scope, iat, exp: iat + ACCESS_TOKEN_TTL }, this.secret);
-    const refresh = sign({ typ: "rt", aud: audience, scope, iat, exp: iat + REFRESH_TOKEN_TTL }, this.secret);
+    const access = seal(
+      { typ: "at", aud: audience, scope, ...identity, iat, exp: iat + ACCESS_TOKEN_TTL },
+      this.key,
+    );
+    const refresh = seal(
+      { typ: "rt", aud: audience, scope, ...identity, ert: entraRefreshToken, iat, exp: iat + REFRESH_TOKEN_TTL },
+      this.key,
+    );
     return {
       access_token: access,
       token_type: "Bearer",
@@ -277,19 +339,29 @@ export class OAuthProvider {
     };
   }
 
-  refreshTokens(refreshToken: string): TokenSet {
-    const payload = unsign(refreshToken, this.secret, "rt");
+  openRefreshToken(refreshToken: string): {
+    audience: string;
+    scope: string;
+    identity: Identity;
+    entraRefreshToken: string;
+  } {
+    const payload = unseal(refreshToken, this.key, "rt");
     if (payload === null) throw new OAuthError("invalid_grant", "invalid or expired refresh_token");
-    const audience = typeof payload.aud === "string" ? payload.aud : "";
-    const scope = typeof payload.scope === "string" ? payload.scope : SCOPE;
-    return this.issueTokens(audience, scope);
+    return {
+      audience: str(payload.aud),
+      scope: str(payload.scope) || SCOPE,
+      identity: identityOf(payload),
+      entraRefreshToken: str(payload.ert),
+    };
   }
 
-  verifyAccessToken(token: string, validAudiences: Set<string>): boolean {
-    const payload = unsign(token, this.secret, "at");
-    if (payload === null) return false;
+  /** Returns who the token belongs to, or null if it isn't valid here. */
+  verifyAccessToken(token: string, validAudiences: Set<string>): Identity | null {
+    const payload = unseal(token, this.key, "at");
+    if (payload === null) return null;
     // RFC 8707: the token must have been issued for this resource.
-    return typeof payload.aud === "string" && validAudiences.has(payload.aud);
+    if (typeof payload.aud !== "string" || !validAudiences.has(payload.aud)) return null;
+    return identityOf(payload);
   }
 
   // --------------------------------------------------------------- helpers
@@ -298,17 +370,6 @@ export class OAuthProvider {
     const url = new URL(redirectUri);
     for (const [name, value] of Object.entries(params)) url.searchParams.set(name, value);
     return url.toString();
-  }
-
-  checkKey(provided: string): boolean {
-    const a = Buffer.from(provided, "utf8");
-    const b = Buffer.from(this.bridgeKey, "utf8");
-    if (a.length !== b.length) {
-      // still do a comparison to keep timing flat-ish
-      timingSafeEqual(Buffer.alloc(32), Buffer.alloc(32));
-      return false;
-    }
-    return timingSafeEqual(a, b);
   }
 }
 
@@ -323,68 +384,12 @@ function escapeHtml(text: string): string {
     .replaceAll("'", "&#39;");
 }
 
-const LOGIN_PAGE = `<!doctype html>
+const PAGE = `<!doctype html>
 <html lang="pt-BR">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>omie-mcp bridge</title>
-    <style>
-        :root { color-scheme: dark; --bg: #0b1220; --text: #e5eefb; --muted: #92a4c3; --accent: #7cc4ff; }
-        * { box-sizing: border-box; }
-        body {
-            margin: 0; min-height: 100vh; display: grid; place-items: center;
-            background: radial-gradient(circle at top, #1a2a49 0%, var(--bg) 60%);
-            color: var(--text); font-family: Arial, Helvetica, sans-serif; padding: 24px;
-        }
-        .card {
-            width: 100%; max-width: 520px; background: rgba(17, 26, 46, 0.92);
-            border: 1px solid rgba(124, 196, 255, 0.22); border-radius: 20px;
-            padding: 28px; box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
-        }
-        h1 { margin: 0 0 8px; font-size: 28px; }
-        p { margin: 0 0 18px; color: var(--muted); line-height: 1.5; }
-        label { display: block; margin: 18px 0 8px; font-weight: 600; }
-        input[type=password] {
-            width: 100%; border: 1px solid rgba(146, 164, 195, 0.35); border-radius: 12px;
-            background: #0b1020; color: var(--text); padding: 14px 16px; font-size: 16px;
-            outline: none;
-        }
-        input[type=password]:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(124, 196, 255, 0.15); }
-        button {
-            margin-top: 16px; width: 100%; border: 0; border-radius: 12px; padding: 14px 16px;
-            background: linear-gradient(135deg, #7cc4ff, #4f8cff); color: #07111f;
-            font-weight: 700; font-size: 16px; cursor: pointer;
-        }
-        .error {
-            margin: 0 0 4px; padding: 12px 14px; border-radius: 12px;
-            background: rgba(255, 108, 108, 0.12); border: 1px solid rgba(255, 108, 108, 0.4);
-            color: #ffb3b3; font-size: 14px;
-        }
-    </style>
-</head>
-<body>
-    <main class="card">
-        <h1>omie-mcp bridge</h1>
-        <p>Informe a chave de acesso para liberar este cliente. Cada pessoa faz esse
-        vínculo individualmente — a chave não fica salva na URL do conector.</p>
-        __ERROR__
-        <form method="post" action="__ACTION__">
-            <label for="key">Chave de acesso</label>
-            <input id="key" name="key" type="password" placeholder="Informe a chave do bridge" autocomplete="off" autofocus required>
-            __HIDDEN__
-            <button type="submit">Vincular</button>
-        </form>
-    </main>
-</body>
-</html>`;
-
-export const INFO_PAGE = `<!doctype html>
-<html lang="pt-BR">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>omie-mcp bridge</title>
+    <title>omie-mcp</title>
     <style>
         :root { color-scheme: dark; }
         body {
@@ -398,32 +403,25 @@ export const INFO_PAGE = `<!doctype html>
         }
         h1 { margin: 0 0 12px; font-size: 26px; }
         p { color: #92a4c3; line-height: 1.6; }
+        .error { color: #ffb3b3; }
     </style>
 </head>
 <body>
     <main class="card">
-        <h1>omie-mcp bridge</h1>
-        <p>Este é o endpoint MCP do servidor. Ele não é feito para ser aberto no navegador.</p>
-        <p>Adicione esta URL como conector no Claude. A chave de acesso será pedida
-        na hora do vínculo, individualmente para cada pessoa.</p>
+        <h1>__TITLE__</h1>
+        __BODY__
     </main>
 </body>
 </html>`;
 
-export function renderLoginPage(opts: {
-  action: string;
-  hidden: Record<string, string>;
-  error?: string;
-}): string {
-  const hiddenHtml = Object.entries(opts.hidden)
-    .filter(([, value]) => Boolean(value))
-    .map(
-      ([name, value]) =>
-        `<input type="hidden" name="${escapeHtml(name)}" value="${escapeHtml(value)}">`,
-    )
-    .join("");
-  const errorHtml = opts.error ? `<div class="error">${escapeHtml(opts.error)}</div>` : "";
-  return LOGIN_PAGE.replace("__ACTION__", escapeHtml(opts.action))
-    .replace("__ERROR__", errorHtml)
-    .replace("__HIDDEN__", hiddenHtml);
+export function renderPage(title: string, paragraphs: string[], isError = false): string {
+  const cls = isError ? ' class="error"' : "";
+  const body = paragraphs.map((p) => `<p${cls}>${escapeHtml(p)}</p>`).join("\n        ");
+  return PAGE.replace("__TITLE__", escapeHtml(title)).replace("__BODY__", body);
 }
+
+export const INFO_PAGE = renderPage("omie-mcp", [
+  "Este é o endpoint MCP do servidor. Ele não é feito para ser aberto no navegador.",
+  "Adicione esta URL como conector no Claude e clique em Conectar: o login é feito " +
+    "com a sua conta Microsoft da Ecovalor, e só quem está no grupo autorizado consegue acessar.",
+]);
