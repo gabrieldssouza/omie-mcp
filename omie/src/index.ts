@@ -49,6 +49,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { omieCredentials } from "./credentials.js";
 
 const DEMO_MODE = process.argv.includes("--demo") || process.env.MCP_DEMO === "true";
 
@@ -62,11 +63,10 @@ const DEMO_RESPONSES: Record<string, unknown> = {
   get_bank_accounts: { ListarContasCorrentes: [{ nCodCC: 4001, cDescricao: "Conta Demo Banco do Brasil", cCodBanco: "001" }] },
 };
 
-const APP_KEY = process.env.OMIE_APP_KEY || "";
-const APP_SECRET = process.env.OMIE_APP_SECRET || "";
 const BASE_URL = "https://app.omie.com.br/api/v1";
 
 async function omieRequest(path: string, call: string, param: unknown[]): Promise<unknown> {
+  const { appKey, appSecret } = omieCredentials();
   const res = await fetch(`${BASE_URL}${path}`, {
     method: "POST",
     headers: {
@@ -74,8 +74,8 @@ async function omieRequest(path: string, call: string, param: unknown[]): Promis
     },
     body: JSON.stringify({
       call,
-      app_key: APP_KEY,
-      app_secret: APP_SECRET,
+      app_key: appKey,
+      app_secret: appSecret,
       param,
     }),
   });

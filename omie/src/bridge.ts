@@ -7,6 +7,11 @@
  *   Claude → /authorize → Microsoft SSO → /auth/callback (group check)
  *   → Claude's redirect_uri with a code → /token → Bearer token on /mcp.
  *
+ * Each company is a separate connector (own path, own Omie keys, own Entra
+ * group). They share one authorization server; the `resource` Claude asks for
+ * picks the connector, and tokens are audience-bound, so a token issued for
+ * one connector is useless on the other.
+ *
  * /mcp only accepts that Bearer token — there is no shared key anymore.
  */
 
@@ -16,13 +21,41 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 
-import { EntraClient, EntraError, describeEntraError, pkcePair } from "./entra.js";
+import { withOmieCredentials } from "./credentials.js";
+import type { OmieCredentials } from "./credentials.js";
+import { EntraClient, EntraError, accessListFromEnv, describeEntraError, pkcePair } from "./entra.js";
+import type { AccessList } from "./entra.js";
 import { INFO_PAGE, OAuthError, OAuthProvider, SCOPE, renderPage } from "./oauth.js";
 import type { PendingAuthorization } from "./oauth.js";
 
-const BRIDGE_PATH = "/mcp";
 const CALLBACK_PATH = "/auth/callback";
 const LOGIN_COOKIE = "omie_mcp_login";
+
+interface Connector {
+  id: string;
+  path: string;
+  credentials: OmieCredentials;
+  access: AccessList;
+}
+
+/** One entry per Omie account. A connector without its Omie key is skipped. */
+function loadConnectors(env: NodeJS.ProcessEnv = process.env): Connector[] {
+  const specs = [
+    { id: "ecovalor", path: "/mcp", suffix: "" },
+    { id: "esgnow", path: "/esgnow/mcp", suffix: "_ESGNOW" },
+  ];
+  const connectors: Connector[] = [];
+  for (const { id, path, suffix } of specs) {
+    const appKey = env[`OMIE_APP_KEY${suffix}`] || "";
+    if (!appKey) continue;
+    const access = accessListFromEnv(`AZURE_ALLOWED_GROUP_IDS${suffix}`, `AZURE_ALLOWED_EMAILS${suffix}`, env);
+    if (access.groups.size === 0 && access.emails.size === 0) {
+      console.error(`AVISO: conector ${id} sem AZURE_ALLOWED_GROUP_IDS${suffix}/AZURE_ALLOWED_EMAILS${suffix} — ninguém conseguirá vincular.`);
+    }
+    connectors.push({ id, path, credentials: { appKey, appSecret: env[`OMIE_APP_SECRET${suffix}`] || "" }, access });
+  }
+  return connectors;
+}
 
 function first(value: unknown): string {
   if (Array.isArray(value)) return typeof value[0] === "string" ? value[0] : "";
@@ -63,9 +96,20 @@ export function installBridge(app: Express, createSession: () => Promise<Server>
   const entra = new EntraClient();
   const tokenSecret = process.env.MCP_TOKEN_SECRET || process.env.AZURE_CLIENT_SECRET || "";
   const oauth = new OAuthProvider(tokenSecret);
-  const transports = new Map<string, StreamableHTTPServerTransport>();
+  const connectors = loadConnectors();
+  if (connectors.length === 0) throw new Error("Nenhum conector configurado: defina OMIE_APP_KEY");
+  const defaultConnector = connectors[0];
+  const transports = new Map<string, { transport: StreamableHTTPServerTransport; connector: string }>();
 
-  const validAudiences = (base: string) => new Set([base, `${base}${BRIDGE_PATH}`, `${base}${BRIDGE_PATH}/`]);
+  /** The resource URLs a connector answers for. The bare origin is kept for
+   *  the first connector, which clients may send as the resource. */
+  const audiencesOf = (connector: Connector, base: string): string[] => {
+    const list = [`${base}${connector.path}`, `${base}${connector.path}/`];
+    if (connector === defaultConnector) list.push(base);
+    return list;
+  };
+  const connectorFor = (resource: string, base: string): Connector | undefined =>
+    connectors.find((c) => audiencesOf(c, base).includes(resource));
 
   const errorPage = (res: Response, status: number, message: string): void => {
     res
@@ -98,25 +142,26 @@ export function installBridge(app: Express, createSession: () => Promise<Server>
   });
 
   app.get("/", (_req, res) => {
-    res.redirect(302, BRIDGE_PATH);
+    res.redirect(302, defaultConnector.path);
   });
 
   // -------------------------------------------------------------- metadata
 
   // RFC 9728 — served on both paths: with and without the resource path.
-  app.get(
-    ["/.well-known/oauth-protected-resource", `/.well-known/oauth-protected-resource${BRIDGE_PATH}`],
-    (req, res) => {
+  for (const connector of connectors) {
+    const paths = [`/.well-known/oauth-protected-resource${connector.path}`];
+    if (connector === defaultConnector) paths.push("/.well-known/oauth-protected-resource");
+    app.get(paths, (req, res) => {
       res.setHeader("Cache-Control", "no-store");
-      res.json(oauth.protectedResourceMetadata(baseUrl(req), BRIDGE_PATH));
-    },
-  );
+      res.json(oauth.protectedResourceMetadata(baseUrl(req), connector.path));
+    });
+  }
 
   // RFC 8414 + OpenID Connect Discovery — the spec requires at least one.
   app.get(
     [
       "/.well-known/oauth-authorization-server",
-      `/.well-known/oauth-authorization-server${BRIDGE_PATH}`,
+      ...connectors.map((c) => `/.well-known/oauth-authorization-server${c.path}`),
       "/.well-known/openid-configuration",
     ],
     (req, res) => {
@@ -155,7 +200,7 @@ export function installBridge(app: Express, createSession: () => Promise<Server>
       redirectUri: first(query.redirect_uri),
       state: first(query.state),
       codeChallenge: first(query.code_challenge),
-      resource: first(query.resource) || `${base}${BRIDGE_PATH}`,
+      resource: first(query.resource) || `${base}${defaultConnector.path}`,
       scope: first(query.scope) || SCOPE,
     };
 
@@ -190,6 +235,7 @@ export function installBridge(app: Express, createSession: () => Promise<Server>
       );
     if (responseType !== "code") return fail("unsupported_response_type");
     if (pending.codeChallenge && codeChallengeMethod && codeChallengeMethod !== "S256") return fail("invalid_request");
+    if (!connectorFor(pending.resource, base)) return fail("invalid_target");
 
     // Binds the login to this browser: the callback must present the cookie.
     const browserNonce = randomBytes(24).toString("base64url");
@@ -236,6 +282,11 @@ export function installBridge(app: Express, createSession: () => Promise<Server>
     }
 
     const { pending } = login;
+    const connector = connectorFor(pending.resource, base);
+    if (!connector) {
+      errorPage(res, 400, "Conector desconhecido. Volte ao Claude e clique em Conectar novamente.");
+      return;
+    }
     const backToClaude = (params: Record<string, string>) =>
       oauth.authorizationRedirect(pending.redirectUri, {
         ...params,
@@ -257,13 +308,14 @@ export function installBridge(app: Express, createSession: () => Promise<Server>
         redirectUri: `${base}${CALLBACK_PATH}`,
         codeVerifier: login.entraVerifier,
         nonce: login.nonce,
+        access: connector.access,
       });
-      console.error(`SSO ok: ${result.identity.email}`);
+      console.error(`SSO ok [${connector.id}]: ${result.identity.email}`);
       const code = oauth.issueCode(pending, result.identity, result.refreshToken);
       res.setHeader("Cache-Control", "no-store").redirect(302, backToClaude({ code }));
     } catch (err) {
       if (err instanceof EntraError) {
-        console.error(`SSO negado: ${err.code} ${err.message}`);
+        console.error(`SSO negado [${connector.id}]: ${err.code} ${err.message}`);
         errorPage(res, 403, err.code === "access_denied" ? describeEntraError(err.code, err.message) : err.message);
       } else {
         console.error("SSO falhou:", err);
@@ -286,17 +338,19 @@ export function installBridge(app: Express, createSession: () => Promise<Server>
           codeVerifier: first(form.code_verifier),
           redirectUri: first(form.redirect_uri),
         });
-        const audience = grant.audience || `${baseUrl(req)}${BRIDGE_PATH}`;
+        const audience = grant.audience || `${baseUrl(req)}${defaultConnector.path}`;
         res.json(oauth.issueTokens(audience, grant.scope, grant.identity, grant.entraRefreshToken));
       } else if (grantType === "refresh_token") {
         const grant = oauth.openRefreshToken(first(form.refresh_token));
+        const connector = connectorFor(grant.audience, baseUrl(req));
+        if (!connector) throw new OAuthError("invalid_grant", "conector não existe mais; vincule novamente");
         // Ask Entra again: a user removed from the group loses access here.
         let renewed;
         try {
-          renewed = await entra.refresh(grant.entraRefreshToken);
+          renewed = await entra.refresh(grant.entraRefreshToken, connector.access);
         } catch (err) {
           if (err instanceof EntraError) {
-            console.error(`Refresh negado para ${grant.identity.email}: ${err.code} ${err.message}`);
+            console.error(`Refresh negado [${connector.id}] para ${grant.identity.email}: ${err.code} ${err.message}`);
             throw new OAuthError("invalid_grant", "sessão Microsoft expirada ou sem acesso; vincule novamente");
           }
           throw err;
@@ -316,74 +370,83 @@ export function installBridge(app: Express, createSession: () => Promise<Server>
 
   // --------------------------------------------------------- /mcp endpoint
 
-  const isAuthorized = (req: Request): boolean => {
+  const isAuthorized = (req: Request, connector: Connector): boolean => {
     const authorization = first(req.headers.authorization);
     if (!authorization.toLowerCase().startsWith("bearer ")) return false;
     const token = authorization.slice(7).trim();
-    return oauth.verifyAccessToken(token, validAudiences(baseUrl(req))) !== null;
+    return oauth.verifyAccessToken(token, new Set(audiencesOf(connector, baseUrl(req)))) !== null;
   };
 
-  const deny = (req: Request, res: Response): void => {
+  const deny = (req: Request, res: Response, connector: Connector): void => {
     // A browser with no credential gets an explanation instead of a raw 401.
     if (req.method === "GET" && isHtmlRequest(req)) {
       res.status(200).setHeader("Cache-Control", "no-store").type("html").send(INFO_PAGE);
       return;
     }
     const challenge =
-      `Bearer resource_metadata="${baseUrl(req)}/.well-known/oauth-protected-resource${BRIDGE_PATH}", ` +
+      `Bearer resource_metadata="${baseUrl(req)}/.well-known/oauth-protected-resource${connector.path}", ` +
       `scope="${SCOPE}"`;
     res.status(401).setHeader("WWW-Authenticate", challenge).type("text/plain").send("Unauthorized");
   };
 
-  app.post(BRIDGE_PATH, async (req, res) => {
-    if (!isAuthorized(req)) {
-      deny(req, res);
-      return;
-    }
+  /** The session's transport, only if it was opened on this same connector. */
+  const sessionOf = (req: Request, connector: Connector): StreamableHTTPServerTransport | undefined => {
     const sessionId = first(req.headers["mcp-session-id"]);
-    const existing = sessionId ? transports.get(sessionId) : undefined;
-    if (existing) {
-      await existing.handleRequest(req, res, req.body);
-      return;
-    }
-    if (!sessionId && isInitializeRequest(req.body)) {
-      const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => randomUUID(),
-        enableJsonResponse: true,
-        onsessioninitialized: (id) => {
-          transports.set(id, transport);
-        },
-      });
-      transport.onclose = () => {
-        if (transport.sessionId) transports.delete(transport.sessionId);
-      };
-      const session = await createSession();
-      await session.connect(transport);
-      await transport.handleRequest(req, res, req.body);
-      return;
-    }
-    res.status(400).json({ jsonrpc: "2.0", error: { code: -32000, message: "Bad Request" }, id: null });
-  });
+    const entry = sessionId ? transports.get(sessionId) : undefined;
+    return entry && entry.connector === connector.id ? entry.transport : undefined;
+  };
 
-  app.get(BRIDGE_PATH, async (req, res) => {
-    if (!isAuthorized(req)) {
-      deny(req, res);
-      return;
-    }
-    const sessionId = first(req.headers["mcp-session-id"]);
-    const transport = sessionId ? transports.get(sessionId) : undefined;
-    if (transport) await transport.handleRequest(req, res);
-    else res.status(400).type("text/plain").send("Invalid session");
-  });
+  for (const connector of connectors) {
+    // Tool handlers read the Omie keys of whichever connector is serving.
+    const serve = <T>(fn: () => Promise<T>) => withOmieCredentials(connector.credentials, fn);
 
-  app.delete(BRIDGE_PATH, async (req, res) => {
-    if (!isAuthorized(req)) {
-      deny(req, res);
-      return;
-    }
-    const sessionId = first(req.headers["mcp-session-id"]);
-    const transport = sessionId ? transports.get(sessionId) : undefined;
-    if (transport) await transport.handleRequest(req, res);
-    else res.status(400).type("text/plain").send("Invalid session");
-  });
+    app.post(connector.path, async (req, res) => {
+      if (!isAuthorized(req, connector)) {
+        deny(req, res, connector);
+        return;
+      }
+      const existing = sessionOf(req, connector);
+      if (existing) {
+        await serve(() => existing.handleRequest(req, res, req.body));
+        return;
+      }
+      if (!first(req.headers["mcp-session-id"]) && isInitializeRequest(req.body)) {
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          enableJsonResponse: true,
+          onsessioninitialized: (id) => {
+            transports.set(id, { transport, connector: connector.id });
+          },
+        });
+        transport.onclose = () => {
+          if (transport.sessionId) transports.delete(transport.sessionId);
+        };
+        const session = await createSession();
+        await session.connect(transport);
+        await serve(() => transport.handleRequest(req, res, req.body));
+        return;
+      }
+      res.status(400).json({ jsonrpc: "2.0", error: { code: -32000, message: "Bad Request" }, id: null });
+    });
+
+    app.get(connector.path, async (req, res) => {
+      if (!isAuthorized(req, connector)) {
+        deny(req, res, connector);
+        return;
+      }
+      const transport = sessionOf(req, connector);
+      if (transport) await serve(() => transport.handleRequest(req, res));
+      else res.status(400).type("text/plain").send("Invalid session");
+    });
+
+    app.delete(connector.path, async (req, res) => {
+      if (!isAuthorized(req, connector)) {
+        deny(req, res, connector);
+        return;
+      }
+      const transport = sessionOf(req, connector);
+      if (transport) await serve(() => transport.handleRequest(req, res));
+      else res.status(400).type("text/plain").send("Invalid session");
+    });
+  }
 }

@@ -423,5 +423,5 @@ export function renderPage(title: string, paragraphs: string[], isError = false)
 export const INFO_PAGE = renderPage("omie-mcp", [
   "Este é o endpoint MCP do servidor. Ele não é feito para ser aberto no navegador.",
   "Adicione esta URL como conector no Claude e clique em Conectar: o login é feito " +
-    "com a sua conta Microsoft da Ecovalor, e só quem está no grupo autorizado consegue acessar.",
+    "com a sua conta Microsoft, e só quem está no grupo autorizado do conector consegue acessar.",
 ]);

@@ -6,9 +6,10 @@
  *   1. In Entra: the enterprise app has "Assignment required" on and only the
  *      allowed group is assigned, so anyone else is stopped at the Microsoft
  *      screen (AADSTS50105).
- *   2. Here: the id_token must carry one of AZURE_ALLOWED_GROUP_IDS in its
- *      `groups` claim, or the user's e-mail must be in AZURE_ALLOWED_EMAILS.
- *      With neither configured nobody gets in (fail closed).
+ *   2. Here, per connector: the id_token must carry one of the connector's
+ *      allowed groups in its `groups` claim, or the user's e-mail must be in
+ *      its e-mail list (see connectors in bridge.ts). With neither configured
+ *      nobody gets in (fail closed).
  *
  * The id_token comes straight from the token endpoint over TLS with client
  * authentication, so per OIDC Core §3.1.3.7 its claims are validated without
@@ -54,6 +55,16 @@ export function pkcePair(): { verifier: string; challenge: string } {
   return { verifier, challenge };
 }
 
+/** Who may use one connector. */
+export interface AccessList {
+  groups: Set<string>;
+  emails: Set<string>;
+}
+
+export function accessListFromEnv(groupsVar: string, emailsVar: string, env: NodeJS.ProcessEnv = process.env): AccessList {
+  return { groups: new Set(csv(env[groupsVar])), emails: new Set(csv(env[emailsVar])) };
+}
+
 export interface EntraLogin {
   identity: Identity;
   refreshToken: string;
@@ -63,21 +74,14 @@ export class EntraClient {
   readonly tenantId: string;
   readonly clientId: string;
   private clientSecret: string;
-  private allowedGroups: Set<string>;
-  private allowedEmails: Set<string>;
 
   constructor(env: NodeJS.ProcessEnv = process.env) {
     this.tenantId = (env.AZURE_TENANT_ID || "").trim();
     this.clientId = (env.AZURE_CLIENT_ID || "").trim();
     this.clientSecret = env.AZURE_CLIENT_SECRET || "";
-    this.allowedGroups = new Set(csv(env.AZURE_ALLOWED_GROUP_IDS));
-    this.allowedEmails = new Set(csv(env.AZURE_ALLOWED_EMAILS));
 
     const missing = ["AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET"].filter((k) => !env[k]);
     if (missing.length) throw new Error(`SSO não configurado: defina ${missing.join(", ")}`);
-    if (this.allowedGroups.size === 0 && this.allowedEmails.size === 0) {
-      console.error("AVISO: AZURE_ALLOWED_GROUP_IDS e AZURE_ALLOWED_EMAILS vazios — ninguém conseguirá vincular.");
-    }
   }
 
   private get issuer(): string {
@@ -100,23 +104,29 @@ export class EntraClient {
   }
 
   /** Authorization code from the /auth/callback redirect → checked identity. */
-  async redeemCode(opts: { code: string; redirectUri: string; codeVerifier: string; nonce: string }): Promise<EntraLogin> {
+  async redeemCode(opts: {
+    code: string;
+    redirectUri: string;
+    codeVerifier: string;
+    nonce: string;
+    access: AccessList;
+  }): Promise<EntraLogin> {
     const tokens = await this.tokenRequest({
       grant_type: "authorization_code",
       code: opts.code,
       redirect_uri: opts.redirectUri,
       code_verifier: opts.codeVerifier,
     });
-    return this.checkLogin(tokens, opts.nonce);
+    return this.checkLogin(tokens, opts.access, opts.nonce);
   }
 
   /** Re-validates the user with Entra; fails if they were disabled or unassigned. */
-  async refresh(refreshToken: string): Promise<EntraLogin> {
+  async refresh(refreshToken: string, access: AccessList): Promise<EntraLogin> {
     if (!refreshToken) throw new EntraError("invalid_grant", "sessão sem refresh token da Microsoft");
     const tokens = await this.tokenRequest({ grant_type: "refresh_token", refresh_token: refreshToken });
     // Entra may not rotate the refresh token on every call.
     if (!tokens.refresh_token) tokens.refresh_token = refreshToken;
-    return this.checkLogin(tokens);
+    return this.checkLogin(tokens, access);
   }
 
   private async tokenRequest(params: Record<string, string>): Promise<Record<string, string>> {
@@ -138,7 +148,7 @@ export class EntraClient {
     return json;
   }
 
-  private checkLogin(tokens: Record<string, string>, expectedNonce?: string): EntraLogin {
+  private checkLogin(tokens: Record<string, string>, access: AccessList, expectedNonce?: string): EntraLogin {
     if (!tokens.id_token) throw new EntraError("invalid_id_token", "a Microsoft não devolveu id_token");
     const claims = decodeJwtPayload(tokens.id_token);
     const now = Math.floor(Date.now() / 1000);
@@ -159,15 +169,15 @@ export class EntraClient {
       email,
       name: String(claims.name || email),
     };
-    this.ensureAllowed(claims, identity);
+    this.ensureAllowed(claims, identity, access);
     return { identity, refreshToken: tokens.refresh_token || "" };
   }
 
-  private ensureAllowed(claims: Record<string, unknown>, identity: Identity): void {
-    if (identity.email && this.allowedEmails.has(identity.email)) return;
+  private ensureAllowed(claims: Record<string, unknown>, identity: Identity, access: AccessList): void {
+    if (identity.email && access.emails.has(identity.email)) return;
 
     const groups = Array.isArray(claims.groups) ? claims.groups.map((g) => String(g).toLowerCase()) : [];
-    if (groups.some((g) => this.allowedGroups.has(g))) return;
+    if (groups.some((g) => access.groups.has(g))) return;
 
     const overage = typeof claims._claim_names === "object" || claims.hasgroups === true;
     if (overage) {
@@ -186,7 +196,7 @@ export function describeEntraError(code: string, description: string): string {
     return "O login foi cancelado ou não foi concluído. Tente vincular novamente pelo Claude.";
   }
   if (description.includes("AADSTS50105") || code === "access_denied") {
-    return "Sua conta não tem acesso a este conector. Peça para incluírem você no grupo Omie-MCP no Azure.";
+    return "Sua conta não tem acesso a este conector. Peça para incluírem você no grupo de acesso dele no Azure.";
   }
   return `Não foi possível concluir o login com a Microsoft (${code}).`;
 }

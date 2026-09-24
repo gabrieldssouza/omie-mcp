@@ -10,25 +10,40 @@ clientes, produtos, pedidos, NF, financeiro, estoque etc.), estendido com:
 - **`omie/src/oauth.ts`** — authorization server OAuth 2.1 mínimo e stateless
   (state, códigos e tokens selados com AES-256-GCM; PKCE S256; Dynamic Client
   Registration; allowlist de redirect).
+- **`omie/src/credentials.ts`** — qual conta do Omie a requisição usa.
 - **`omie/src/entra.ts`** — login SSO no Microsoft Entra ID e checagem do grupo.
 - **`omie/src/bridge.ts`** — Express: metadata RFC 8414/9728, `/authorize`
   (redireciona para a Microsoft), `/auth/callback`, `/token`, `/register`, e a
   guarda do `/mcp` (só Bearer token — não existe mais chave compartilhada).
 
+## Conectores
+
+O mesmo Web App serve um conector por conta do Omie. Cada um tem suas chaves e
+seu grupo no Entra, e é adicionado no Claude como um conector separado:
+
+| Conector | URL | Chaves Omie | Grupo Entra |
+|---|---|---|---|
+| Ecovalor | `https://<app>.azurewebsites.net/mcp` | `OMIE_APP_KEY` / `OMIE_APP_SECRET` | **Omie-MCP** → `AZURE_ALLOWED_GROUP_IDS` |
+| ESG Now | `https://<app>.azurewebsites.net/esgnow/mcp` | `OMIE_APP_KEY_ESGNOW` / `OMIE_APP_SECRET_ESGNOW` | **Omie-MCP ESG Now** → `AZURE_ALLOWED_GROUP_IDS_ESGNOW` |
+
+Os tokens ficam presos ao conector em que a pessoa se vinculou: quem está só num
+grupo não consegue vincular o outro, e um token de um conector é recusado no outro.
+Um conector sem a sua `OMIE_APP_KEY*` simplesmente não é publicado.
+
 ## Fluxo de vínculo no Claude
 
-1. Adicione `https://<app>.azurewebsites.net/mcp` como conector.
+1. Adicione a URL do conector (tabela acima) no Claude.
 2. A pessoa clica em **Conectar**; o Claude abre `/authorize`, que manda o
    navegador para a tela de login da Microsoft.
-3. Depois do login, `/auth/callback` confere se a conta está no grupo
-   **Omie-MCP** e devolve o código para o Claude.
+3. Depois do login, `/auth/callback` confere se a conta está no grupo daquele
+   conector e devolve o código para o Claude.
 4. O Claude recebe um access token pessoal (1 h). A cada renovação o servidor
    consulta a Microsoft de novo: quem sair do grupo perde o acesso em até 1 h.
 
 O acesso é barrado em dois lugares: no Entra (enterprise app com *Assignment
 required* e só o grupo atribuído — quem está fora recebe AADSTS50105 na própria
-tela da Microsoft) e no servidor (claim `groups` precisa conter
-`AZURE_ALLOWED_GROUP_IDS`, ou o e-mail estar em `AZURE_ALLOWED_EMAILS`).
+tela da Microsoft) e no servidor (claim `groups` precisa conter o grupo do
+conector, ou o e-mail estar na lista `AZURE_ALLOWED_EMAILS*` dele).
 
 ## Entra ID
 
@@ -38,7 +53,8 @@ App registration **Omie-MCP** (single tenant):
 - Client secret → `AZURE_CLIENT_SECRET`
 - Manifest: `"groupMembershipClaims": "ApplicationGroup"` (o token só traz os
   grupos atribuídos ao app, evitando o limite de grupos no token)
-- Enterprise app: *Assignment required* = Sim; grupo **Omie-MCP** atribuído
+- Enterprise app: *Assignment required* = Sim; grupos **Omie-MCP** e
+  **Omie-MCP ESG Now** atribuídos (o app registration é o mesmo para os dois)
 
 Para dar ou tirar acesso, basta incluir ou remover a pessoa do grupo.
 
@@ -47,10 +63,11 @@ Para dar ou tirar acesso, basta incluir ou remover a pessoa do grupo.
 - **Stack**: Node 22 (Linux)
 - **Startup command**: `node dist/index.js` (ou vazio — `npm start` faz o mesmo)
 - **App settings**:
-  - `OMIE_APP_KEY` / `OMIE_APP_SECRET` — credenciais do OMIE
+  - `OMIE_APP_KEY` / `OMIE_APP_SECRET` — Omie da Ecovalor
+  - `OMIE_APP_KEY_ESGNOW` / `OMIE_APP_SECRET_ESGNOW` — Omie da ESG Now
   - `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` — app registration
-  - `AZURE_ALLOWED_GROUP_IDS` — object ID do grupo Omie-MCP
-  - `AZURE_ALLOWED_EMAILS` (opcional) — e-mails liberados fora do grupo
+  - `AZURE_ALLOWED_GROUP_IDS` / `AZURE_ALLOWED_GROUP_IDS_ESGNOW` — object ID do grupo de cada conector
+  - `AZURE_ALLOWED_EMAILS` / `AZURE_ALLOWED_EMAILS_ESGNOW` (opcional) — e-mails liberados fora do grupo
   - `MCP_PUBLIC_URL` (opcional) — fixa a URL pública usada no redirect URI
   - `MCP_TOKEN_SECRET` (opcional) — rotaciona todos os tokens emitidos
   - `MCP_ALLOWED_REDIRECT_HOSTS` (opcional) — hosts extras de callback OAuth
